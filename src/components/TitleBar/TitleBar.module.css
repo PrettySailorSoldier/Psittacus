@@ -1,0 +1,48 @@
+.titlebar {
+  height: 40px;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+  /* Allow window drag */
+  -webkit-app-region: drag;
+  border-top-left-radius: var(--radius-md);
+  border-top-right-radius: var(--radius-md);
+}
+
+.title {
+  padding-left: 16px;
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 18px;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+.controls {
+  display: flex;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.button {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.button:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.close:hover {
+  background: var(--danger);
+  color: #fff;
+}

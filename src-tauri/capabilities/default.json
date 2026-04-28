@@ -1,0 +1,65 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for Psittacus",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-start-dragging",
+    "core:event:default",
+    "core:event:allow-listen",
+    "shell:allow-execute",
+    "fs:allow-read",
+    "fs:allow-write",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "path:allow-app-temp-dir",
+    "path:allow-resource-dir",
+    "clipboard-manager:allow-write-text",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "ffmpeg",
+          "cmd": "ffmpeg",
+          "args": true
+        },
+        {
+          "name": "ffprobe",
+          "cmd": "ffprobe",
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read",
+      "allow": [
+        "$APPDATA",
+        "$TEMP",
+        "$TEMP/*",
+        "$TEMP/**/*",
+        "$DOWNLOAD",
+        "$DOCUMENT",
+        "$DESKTOP",
+        "$HOME"
+      ]
+    },
+    {
+      "identifier": "fs:allow-write",
+      "allow": [
+        "$APPDATA",
+        "$TEMP",
+        "$TEMP/*",
+        "$TEMP/**/*",
+        "$DOWNLOAD",
+        "$DOCUMENT",
+        "$DESKTOP"
+      ]
+    }
+  ]
+}

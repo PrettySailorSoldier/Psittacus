@@ -1,0 +1,48 @@
+/* src/styles/global.css */
+:root {
+  --bg-base: #0f0f13;
+  --bg-elevated: #1a1a22;
+  --bg-card: #21212c;
+  --border: rgba(255, 255, 255, 0.07);
+  --text-primary: #f0eef8;
+  --text-secondary: #8a87a0;
+  --text-muted: #4a4860;
+  --accent: #7c5cbf;
+  --accent-glow: rgba(124, 92, 191, 0.25);
+  --accent-hover: #9470d6;
+  --danger: #b55f7c;
+  --success: #5a9e7c;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+}
+
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: transparent;
+  color: var(--text-primary);
+  margin: 0;
+  overflow: hidden; /* App takes up whole window */
+  user-select: none;
+}
+
+#root {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border); /* to make the transparent frameless look nice */
+  box-sizing: border-box;
+}
+
+.display {
+  font-family: 'Cormorant Garamond', serif;
+}
+
+* {
+  box-sizing: border-box;
+}

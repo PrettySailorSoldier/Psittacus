@@ -1,0 +1,88 @@
+/* DropZone.module.css */
+.container {
+  flex: 1;
+  margin: 24px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.container:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 20px var(--accent-glow);
+}
+
+.dragOver {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+
+.inner {
+  text-align: center;
+  pointer-events: none;
+}
+
+.iconLarge {
+  color: var(--accent);
+  margin-bottom: 16px;
+}
+
+.title {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.subtitle {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+/* READY STATE STRIP */
+.readyStrip {
+  height: 56px;
+  margin: 24px 24px 0 24px;
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  border: 1px solid var(--border);
+}
+
+.iconSmall {
+  color: var(--accent);
+  margin-right: 12px;
+  flex-shrink: 0;
+}
+
+.filename {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.clearBtn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  transition: all 0.2s;
+}
+
+.clearBtn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
