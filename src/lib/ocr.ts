@@ -10,6 +10,16 @@ async function imageToBase64(imagePath: string): Promise<string> {
   return btoa(binary);
 }
 
+function cleanResponse(text: string): string {
+  return text
+    .replace(/```[\w]*\n?/g, '')        // strip code fences
+    .replace(/^The image (shows|displays|contains|depicts)[^\n]*\n?/gim, '')
+    .replace(/^Here is the (extracted )?text:?\n?/gim, '')
+    .replace(/^I can see[^\n]*\n?/gim, '')
+    .replace(/^This (image|screenshot|document)[^\n]*\n?/gim, '')
+    .trim();
+}
+
 export async function ocrImage(imagePath: string, _language: string): Promise<string> {
   try {
     const base64 = await imageToBase64(imagePath);
@@ -20,7 +30,7 @@ export async function ocrImage(imagePath: string, _language: string): Promise<st
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'llava',
-        prompt: 'Extract all text from this image exactly as it appears. Preserve formatting like headings, bullet points, and paragraphs. Output only the extracted text, nothing else.',
+        prompt: 'Transcribe only the document text visible in this image. Do not describe the image. Do not add any commentary. Do not use code blocks. Output only the raw text exactly as it appears, preserving headings and paragraphs.',
         images: [base64],
         stream: false,
       }),
@@ -30,7 +40,7 @@ export async function ocrImage(imagePath: string, _language: string): Promise<st
     if (!response.ok) throw new Error(`Ollama error: ${response.status}`);
     const data = await response.json();
     console.log(`[OCR] response data:`, data);
-    return (data.response ?? '').trim();
+    return cleanResponse((data.response ?? '').trim());
   } catch (error) {
     console.error(`[OCR] failed for ${imagePath}:`, error);
     return '';
