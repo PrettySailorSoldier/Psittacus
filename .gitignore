@@ -28,3 +28,6 @@ src-tauri/target/
 src-tauri/binaries/
 
 # FFmpeg sidecars - too large for git, download manually
+
+# Local sample/debug output
+samples/
