@@ -13,6 +13,7 @@ async function imageToBase64(imagePath: string): Promise<string> {
 export async function ocrImage(imagePath: string, _language: string): Promise<string> {
   try {
     const base64 = await imageToBase64(imagePath);
+    console.log(`[OCR] sending frame to Ollama: ${imagePath}`);
 
     const response = await fetch('http://localhost:11434/api/generate', {
       method: 'POST',
@@ -25,11 +26,13 @@ export async function ocrImage(imagePath: string, _language: string): Promise<st
       }),
     });
 
+    console.log(`[OCR] response status: ${response.status}`);
     if (!response.ok) throw new Error(`Ollama error: ${response.status}`);
     const data = await response.json();
+    console.log(`[OCR] response data:`, data);
     return (data.response ?? '').trim();
   } catch (error) {
-    console.error(`OCR failed for ${imagePath}:`, error);
+    console.error(`[OCR] failed for ${imagePath}:`, error);
     return '';
   }
 }
