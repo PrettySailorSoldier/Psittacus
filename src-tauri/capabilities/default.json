@@ -14,12 +14,12 @@
     "core:event:default",
     "core:event:allow-listen",
     "shell:allow-execute",
-    "fs:allow-read",
-    "fs:allow-write",
+    "fs:default",
+    "fs:read-all",
+    "fs:write-all",
     "fs:allow-mkdir",
-    "fs:allow-temp-write",
-    "fs:allow-temp-write-recursive",
     "fs:allow-remove",
+    "fs:allow-read-dir",
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",
@@ -41,31 +41,6 @@
           "sidecar": true,
           "args": true
         }
-      ]
-    },
-    {
-      "identifier": "fs:allow-read",
-      "allow": [
-        "$APPDATA",
-        "$TEMP",
-        "$TEMP/*",
-        "$TEMP/**/*",
-        "$DOWNLOAD",
-        "$DOCUMENT",
-        "$DESKTOP",
-        "$HOME"
-      ]
-    },
-    {
-      "identifier": "fs:allow-write",
-      "allow": [
-        "$APPDATA",
-        "$TEMP",
-        "$TEMP/*",
-        "$TEMP/**/*",
-        "$DOWNLOAD",
-        "$DOCUMENT",
-        "$DESKTOP"
       ]
     }
   ]
