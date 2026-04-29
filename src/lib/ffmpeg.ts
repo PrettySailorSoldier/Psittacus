@@ -23,8 +23,7 @@ export async function getVideoDuration(videoPath: string): Promise<number> {
 export async function extractFrames(
   videoPath: string,
   outputDir: string,
-  intervalSeconds: number,
-  onProgress?: (frameNum: number) => void
+  intervalSeconds: number
 ): Promise<string[]> {
   // Using path plugin to format the output template
   // ffmpeg expects output like /tempdir/frame_%04d.png
@@ -43,13 +42,7 @@ export async function extractFrames(
     pattern,
   ]);
 
-  // We can listen to stdout/stderr to infer progress if we want, but ffmpeg progress is tricky.
-  // The simplest way is to just let it finish. The onProgress callback requested was for extraction,
-  // but ffmpeg sidecar gives us output events. 
-  // We'll just execute it and wait for it to complete.
-  cmd.on('close', data => {
-    // console.log(`ffmpeg finished with code ${data.code} and signal ${data.signal}`);
-  });
+
 
   const output = await cmd.execute();
   if (output.code !== 0) {

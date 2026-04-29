@@ -1,21 +1,3 @@
-// Simple character-level Jaccard similarity between two strings
-function similarity(a: string, b: string): number {
-  if (a.length === 0 && b.length === 0) return 1;
-  if (a.length === 0 || b.length === 0) return 0;
-
-  const setA = new Set(a.split(''));
-  const setB = new Set(b.split(''));
-
-  let intersectionSize = 0;
-  for (const char of setA) {
-    if (setB.has(char)) {
-      intersectionSize++;
-    }
-  }
-
-  const unionSize = setA.size + setB.size - intersectionSize;
-  return intersectionSize / unionSize;
-}
 
 // Another similarity metric could be word-based, but character-based is robust for OCR noise.
 // A more advanced approach uses Levenshtein distance, but Jaccard is faster for a quick check.

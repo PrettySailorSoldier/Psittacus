@@ -1,5 +1,4 @@
-import { Store } from '@tauri-apps/plugin-store';
-
+import { load, Store } from '@tauri-apps/plugin-store';
 export interface Settings {
   sampleInterval: number;
   language: string;
@@ -19,7 +18,7 @@ let store: Store | null = null;
 
 async function getStore(): Promise<Store> {
   if (!store) {
-    store = new Store('psittacus-settings.json');
+    store = await load('psittacus-settings.json');
   }
   return store;
 }

@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { open, save } from '@tauri-apps/plugin-dialog';
-import { appTempDir, join } from '@tauri-apps/api/path';
+import { open } from '@tauri-apps/plugin-dialog';
+import { tempDir, join } from '@tauri-apps/api/path';
 import { mkdir, remove } from '@tauri-apps/plugin-fs';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+
 
 import TitleBar from './components/TitleBar/TitleBar';
 import DropZone from './components/DropZone/DropZone';
@@ -107,7 +107,7 @@ export default function App() {
       setProgress({ current: 0, total: estimatedTotal, lastSnippet: 'Extracting frames...' });
 
       // Create a unique temp directory
-      const tempPath = await appTempDir();
+      const tempPath = await tempDir();
       const runId = Date.now().toString();
       const frameDir = await join(tempPath, `psittacus_run_${runId}`);
       await mkdir(frameDir, { recursive: true });

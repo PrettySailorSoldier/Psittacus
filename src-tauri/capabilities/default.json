@@ -18,9 +18,6 @@
     "fs:allow-write",
     "dialog:allow-open",
     "dialog:allow-save",
-    "path:allow-app-temp-dir",
-    "path:allow-resource-dir",
-    "clipboard-manager:allow-write-text",
     {
       "identifier": "shell:allow-execute",
       "allow": [
