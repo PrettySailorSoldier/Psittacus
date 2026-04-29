@@ -19,8 +19,8 @@ export async function ocrImage(imagePath: string, _language: string): Promise<st
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'moondream',
-        prompt: 'Extract all text from this image exactly as it appears. Preserve the original formatting: headings, paragraphs, bullet points, indentation, and line breaks. Output only the extracted text, nothing else.',
+        model: 'llava',
+        prompt: 'Extract all text from this image exactly as it appears. Preserve formatting like headings, bullet points, and paragraphs. Output only the extracted text, nothing else.',
         images: [base64],
         stream: false,
       }),
