@@ -41,9 +41,7 @@ export default function App() {
   };
 
   const processFile = async (filePath: string) => {
-    console.log('[processFile] called with:', filePath);
     try {
-      // Basic validation based on extension
       const validExts = ['.mp4', '.mov', '.mkv', '.webm', '.avi'];
       const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
       if (!validExts.includes(ext)) {
@@ -52,10 +50,7 @@ export default function App() {
       }
 
       const name = filePath.split(/[\\/]/).pop() || 'Unknown File';
-
-      console.log('[processFile] calling getVideoDuration...');
       const duration = await getVideoDuration(filePath);
-      console.log('[processFile] duration:', duration);
       
       setFile({
         path: filePath,
@@ -89,26 +84,18 @@ export default function App() {
   }, []);
 
   const handleManualOpen = async () => {
-    console.log('[handleManualOpen] opening dialog');
-    try {
-      const selected = await open({
-        multiple: false,
-        filters: [{
-          name: 'Video',
-          extensions: ['mp4', 'mov', 'mkv', 'webm', 'avi']
-        }]
-      });
-      console.log('[handleManualOpen] selected:', selected, 'type:', typeof selected);
-      if (typeof selected === 'string') {
-        processFile(selected);
-      } else if (selected !== null) {
-        // In some plugin-dialog RC versions, the path is nested
-        const path = (selected as any)?.path ?? (Array.isArray(selected) ? selected[0] : null);
-        console.log('[handleManualOpen] extracted path:', path);
-        if (path) processFile(path);
-      }
-    } catch (e) {
-      console.error('[handleManualOpen] error:', e);
+    const selected = await open({
+      multiple: false,
+      filters: [{
+        name: 'Video',
+        extensions: ['mp4', 'mov', 'mkv', 'webm', 'avi']
+      }]
+    });
+    if (typeof selected === 'string') {
+      processFile(selected);
+    } else if (selected !== null) {
+      const path = (selected as any)?.path ?? (Array.isArray(selected) ? selected[0] : null);
+      if (path) processFile(path);
     }
   };
 
