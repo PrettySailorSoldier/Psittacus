@@ -1,24 +1,33 @@
-import Tesseract from 'tesseract.js';
 import { deduplicateText } from './dedup';
 
-export async function ocrImage(imagePath: string, language: string): Promise<string> {
+async function imageToBase64(imagePath: string): Promise<string> {
+  const { readFile } = await import('@tauri-apps/plugin-fs');
+  const bytes = await readFile(imagePath);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+export async function ocrImage(imagePath: string, _language: string): Promise<string> {
   try {
-    // tesseract.js recognize can take a URL or a file path in Node.
-    // In Tauri (browser context), we might need to load the file as a Blob or array buffer first.
-    // However, Tesseract.js in a browser can take an image element, canvas, or a File/Blob.
-    // We must read the file from disk using Tauri fs plugin and pass it as a buffer/Blob.
-    
-    const { readFile } = await import('@tauri-apps/plugin-fs');
-    const fileData = await readFile(imagePath);
-    
-    // Convert Uint8Array to Blob
-    const blob = new Blob([fileData], { type: 'image/png' });
-    
-    const result = await Tesseract.recognize(blob, language, {
-      // logger: m => console.log(m) // Optional logger
+    const base64 = await imageToBase64(imagePath);
+
+    const response = await fetch('http://localhost:11434/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'moondream',
+        prompt: 'Extract all text from this image exactly as it appears. Preserve the original formatting: headings, paragraphs, bullet points, indentation, and line breaks. Output only the extracted text, nothing else.',
+        images: [base64],
+        stream: false,
+      }),
     });
-    
-    return result.data.text.trim();
+
+    if (!response.ok) throw new Error(`Ollama error: ${response.status}`);
+    const data = await response.json();
+    return (data.response ?? '').trim();
   } catch (error) {
     console.error(`OCR failed for ${imagePath}:`, error);
     return '';
@@ -32,7 +41,7 @@ export async function runOcrPipeline(
   onFrameDone: (frameIndex: number, text: string) => void
 ): Promise<string> {
   const framesText: string[] = [];
-  
+
   for (let i = 0; i < framePaths.length; i++) {
     const text = await ocrImage(framePaths[i], language);
     framesText.push(text);
