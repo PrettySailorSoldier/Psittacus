@@ -17,9 +17,24 @@
     "fs:default",
     "fs:read-all",
     "fs:write-all",
-    "fs:allow-mkdir",
     "fs:allow-remove",
     "fs:allow-read-dir",
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": ["$TEMP", "$TEMP/**", "$APPDATA", "$APPDATA/**"]
+    },
+    {
+      "identifier": "fs:allow-remove",
+      "allow": ["$TEMP", "$TEMP/**"]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": ["$TEMP", "$TEMP/**"]
+    },
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": ["$TEMP", "$TEMP/**"]
+    },
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",
