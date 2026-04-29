@@ -65,8 +65,13 @@ export default function App() {
       });
       setAppState('ready');
     } catch (e) {
-      console.error(e);
-      alert('Failed to process video file.');
+      console.error('processFile error:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setAppState('idle');
+      // Use Tauri dialog for errors so it appears on top of the frameless window
+      import('@tauri-apps/plugin-dialog').then(({ message }) =>
+        message(`Failed to load video:\n${msg}`, { title: 'Error', kind: 'error' })
+      );
     }
   };
 
