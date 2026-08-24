@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -11,14 +11,16 @@ import ControlPanel from './components/ControlPanel/ControlPanel';
 import ProgressView from './components/ProgressView/ProgressView';
 import OutputView from './components/OutputView/OutputView';
 import RecordButton from './components/RecordButton/RecordButton';
+import CropSelector from './components/CropSelector/CropSelector';
 
-import { Settings, loadSettings, saveSettings } from './store/settings';
+import { Settings, loadSettings, saveSettings, loadCropRegion, saveCropRegion } from './store/settings';
 import { getVideoDuration, extractFrames } from './lib/ffmpeg';
 import { dedupeFrames } from './lib/frameDedup';
+import { CropRegion, cropFrames } from './lib/cropFrames';
 // runOcrPipeline kept as an unused manual fallback (llava-only mode)
 import { runOcrPipeline as _runOcrPipeline, runHybridOcrPipeline } from './lib/ocr';
 
-export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'done';
+export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'cropping' | 'done';
 
 export interface FileInfo {
   path: string;
@@ -32,12 +34,31 @@ export default function App() {
   const [file, setFile] = useState<FileInfo | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [progress, setProgress] = useState({ current: 0, total: 0, lastSnippet: '' });
-  const [output, setOutput] = useState<{ text: string; wordCount: number; frameCount: number } | null>(null);
+  const [output, setOutput] = useState<{
+    text: string;
+    wordCount: number;
+    frameCount: number;
+    /** Raw per-frame OCR text, kept so the optional cleanup pass can rerun from source. */
+    frameTexts: string[];
+  } | null>(null);
   // Path of the cached recording mp4 so we can discard it after processing
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
 
+  // ── Crop step state ────────────────────────────────────────────────────────
+  // The crop selector sits in the middle of an async pipeline, so `handleRun`
+  // parks on a promise that the Confirm/Skip handlers resolve. `cropResolver`
+  // holds that promise's resolve fn; `cropPrompt` holds what the UI needs to
+  // render. Keeping the resolver in a ref (not state) avoids re-rendering the
+  // selector every time the pipeline touches unrelated state.
+  const cropResolver = useRef<((region: CropRegion | null) => void) | null>(null);
+  const [cropPrompt, setCropPrompt] = useState<{ framePath: string; frameCount: number } | null>(null);
+  // Last-used region, restored from the store so repeat recordings of the same
+  // reader window are a single confirm click.
+  const [cropRegion, setCropRegion] = useState<CropRegion | null>(null);
+
   useEffect(() => {
     loadSettings().then(setSettings);
+    loadCropRegion().then(setCropRegion);
   }, []);
 
   const handleSettingsChange = (newSettings: Settings) => {
@@ -111,6 +132,28 @@ export default function App() {
     showError(msg, 'Recording Error');
   };
 
+  // ── Crop step ─────────────────────────────────────────────────────────────
+
+  /**
+   * Show the crop selector and wait for the user's decision.
+   * Resolves with a region to crop to, or null if they skipped.
+   */
+  const askForCropRegion = (framePath: string, frameCount: number) =>
+    new Promise<CropRegion | null>(resolve => {
+      cropResolver.current = resolve;
+      setCropPrompt({ framePath, frameCount });
+      setAppState('cropping');
+    });
+
+  /** Hand the decision back to the parked pipeline and return to the progress view. */
+  const finishCropStep = (region: CropRegion | null) => {
+    const resolve = cropResolver.current;
+    cropResolver.current = null;
+    setCropPrompt(null);
+    setAppState('processing');
+    resolve?.(region);
+  };
+
   // ── Extraction pipeline ───────────────────────────────────────────────────
 
   const handleRun = async () => {
@@ -136,10 +179,30 @@ export default function App() {
       const dedupedPaths = await dedupeFrames(framePaths);
       console.log(`[OCR] frames extracted: ${framePaths.length}, after dedup: ${dedupedPaths.length}`);
 
-      // 3. Run hybrid OCR pipeline (Tesseract primary, llava fallback)
-      setProgress({ current: 0, total: dedupedPaths.length, lastSnippet: 'Starting OCR...' });
+      // 3. Let the user crop away the reader chrome (sidebar, page arrows).
+      //    Runs after dedup, not before: cropping doesn't change which frames
+      //    are near-duplicates of each other, so doing it here avoids paying
+      //    the crop cost on frames that get discarded anyway.
+      let ocrPaths = dedupedPaths;
+      if (dedupedPaths.length > 0) {
+        const region = await askForCropRegion(dedupedPaths[0], dedupedPaths.length);
+
+        if (region) {
+          setCropRegion(region);
+          saveCropRegion(region); // fire-and-forget: a failed save is not fatal
+          setProgress({ current: 0, total: dedupedPaths.length, lastSnippet: 'Cropping frames...' });
+          ocrPaths = await cropFrames(dedupedPaths, region, (done, total) => {
+            setProgress({ current: done, total, lastSnippet: `Cropping frame ${done}/${total}...` });
+          });
+        } else {
+          console.log('[Crop] skipped — OCR will run on full frames');
+        }
+      }
+
+      // 4. Run hybrid OCR pipeline (Tesseract primary, llava fallback)
+      setProgress({ current: 0, total: ocrPaths.length, lastSnippet: 'Starting OCR...' });
       const finalResult = await runHybridOcrPipeline(
-        dedupedPaths,
+        ocrPaths,
         settings.language,
         settings.dedupeThreshold,
         (frameIndex, text) => {
@@ -157,6 +220,7 @@ export default function App() {
         text: finalResult.text,
         wordCount,
         frameCount: finalResult.framesProcessed,
+        frameTexts: finalResult.frameTexts,
       });
       setAppState('done');
 
@@ -229,6 +293,16 @@ export default function App() {
           />
         )}
 
+        {appState === 'cropping' && cropPrompt && (
+          <CropSelector
+            framePath={cropPrompt.framePath}
+            frameCount={cropPrompt.frameCount}
+            initialRegion={cropRegion}
+            onConfirm={region => finishCropStep(region)}
+            onSkip={() => finishCropStep(null)}
+          />
+        )}
+
         {appState === 'processing' && (
           <ProgressView
             current={progress.current}
@@ -244,6 +318,7 @@ export default function App() {
             frameCount={output.frameCount}
             exportFormat={settings.exportFormat}
             onReset={handleReset}
+            rawFrameTexts={output.frameTexts}
           />
         )}
       </div>

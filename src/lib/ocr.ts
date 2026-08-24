@@ -130,7 +130,31 @@ export async function runOcrPipeline(
 
 // ── Hybrid pipeline (Tesseract primary, llava fallback) ───────────────────────
 
-/** Minimum mean per-word Tesseract confidence (0–100) to accept its result. */
+/**
+ * Minimum mean per-word Tesseract confidence to accept its result, on
+ * Tesseract's native 0–100 scale (matching `TesseractResult.confidence`,
+ * which `parse_tsv` computes as the mean of the TSV `conf` column).
+ *
+ * Measured behaviour on clean printed textbook pages: mean confidence sits at
+ * 94–96, with per-word values spread across 0–97. Nothing near this threshold.
+ * That is why a normal run logs `decision=tesseract` on every frame and no
+ * llava fallback lines appear — the gate is working, the input is just easy.
+ *
+ * The gate does fire on genuinely bad input: degrading a frame until Tesseract
+ * can barely read it drops the mean to 55.6, and an unreadable frame reports
+ * 0.0, both routing to llava.
+ *
+ * Raise this toward ~85 to push more borderline frames to llava (slower, but
+ * llava handles low-res and handwriting far better); lower it toward ~40 to
+ * keep more frames on Tesseract when llava is unavailable or too slow.
+ *
+ * CAVEAT — this score measures precision, not recall. Tesseract only reports
+ * confidence for words it actually recognised; text it misses entirely never
+ * enters the average. A blurred frame that yielded 7 words instead of 197
+ * still scored 96.1 and was accepted. If messier source material starts going
+ * through this pipeline, a low word count is the signal to watch, not a low
+ * confidence — which is why the per-frame log below reports `words=` too.
+ */
 const TESSERACT_CONFIDENCE_THRESHOLD = 60;
 
 /** Shape of the result returned by the Rust tesseract_ocr_image command. */
@@ -142,6 +166,13 @@ interface TesseractCommandResult {
 /** Extended result for the hybrid pipeline — distinguishes engine sources. */
 export interface HybridOcrResult {
   text: string;
+  /**
+   * Per-frame OCR output, in frame order, before text-level dedup is applied.
+   * Kept so the optional cleanup pass (`lib/textCleanup.ts`) can work from the
+   * raw extraction, and so the raw result stays available to the user rather
+   * than being replaced by any downstream transform.
+   */
+  frameTexts: string[];
   /** Total frames that entered the OCR loop (already deduped). */
   framesProcessed: number;
   /** Frames that produced any non-empty text from either engine. */
@@ -199,12 +230,21 @@ export async function runHybridOcrPipeline(
       tResult.confidence >= TESSERACT_CONFIDENCE_THRESHOLD &&
       tResult.text.trim().length > 0;
 
+    // Unconditional per-frame decision log. Previously the accept path and the
+    // fallback path each logged their own line, which made "no fallback lines
+    // in the console" ambiguous between "the check never fires" and "the check
+    // fires and always passes". One line per frame, always, removes that.
+    console.log(
+      `[OCR] frame ${label}: tesseract confidence=` +
+      `${tResult ? tResult.confidence.toFixed(1) : 'n/a (invocation failed)'}, ` +
+      `threshold=${TESSERACT_CONFIDENCE_THRESHOLD}, ` +
+      `words=${tResult ? tResult.text.trim().split(/\s+/).filter(Boolean).length : 0}, ` +
+      `decision=${tesseractAccepted ? 'tesseract' : 'fallback'}`
+    );
+
     if (tesseractAccepted && tResult) {
       text = tResult.text;
       framesViaTesseract++;
-      console.log(
-        `[OCR] frame ${label}: tesseract (confidence: ${tResult.confidence.toFixed(1)})`
-      );
     } else {
       // ── Step 2: llava fallback ─────────────────────────────────────────────
       if (tResult !== null) {
@@ -242,6 +282,7 @@ export async function runHybridOcrPipeline(
 
   return {
     text: deduplicateText(framesText, dedupeThreshold),
+    frameTexts: framesText,
     framesProcessed: framesText.length,
     framesWithText,
     framesViaTesseract,

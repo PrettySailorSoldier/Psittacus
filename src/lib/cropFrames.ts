@@ -85,8 +85,8 @@ export function clampRegion(region: CropRegion, width: number, height: number): 
 
 /** Build the output path for a cropped frame, alongside its source. */
 function croppedPathFor(framePath: string): string {
-  const sep = framePath.includes('\') ? '\' : '/';
-  const idx = Math.max(framePath.lastIndexOf('\'), framePath.lastIndexOf('/'));
+  const sep = framePath.includes('\\') ? '\\' : '/';
+  const idx = Math.max(framePath.lastIndexOf('\\'), framePath.lastIndexOf('/'));
   const dir = idx >= 0 ? framePath.slice(0, idx) : '.';
   const name = idx >= 0 ? framePath.slice(idx + 1) : framePath;
   return `${dir}${sep}cropped_${name}`;

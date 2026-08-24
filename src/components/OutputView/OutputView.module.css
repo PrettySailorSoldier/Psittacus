@@ -101,3 +101,80 @@
   background: var(--accent);
   border-color: var(--accent);
 }
+
+/* ── Raw / Cleaned toggle ─────────────────────────────────────────────────── */
+
+.topBar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.deltaNote {
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.toggleGroup {
+  display: flex;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  flex-shrink: 0;
+}
+
+.toggleBtn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 5px 12px;
+  border-radius: 4px;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.toggleBtn:hover:not(:disabled):not(.toggleActive) {
+  color: var(--text-primary);
+}
+
+.toggleActive {
+  background: var(--accent);
+  color: var(--text-primary);
+}
+
+.toggleBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.errorBar {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+  background: rgba(181, 95, 124, 0.08);
+  border: 1px solid rgba(181, 95, 124, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.ghostBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
