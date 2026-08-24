@@ -1,16 +1,14 @@
-//! Tesseract OCR via the bundled sidecar binary.
+//! Tesseract OCR via `std::process::Command`.
 //!
-//! Runs `tesseract <image> stdout tsv` and parses the TSV output into a plain
-//! text string plus a mean confidence score (0–100). The confidence is the
-//! average of per-word `conf` values reported by Tesseract; structural rows
-//! (level < 5 or conf == -1) are excluded from both the text and the average.
+//! Spawns the system-installed `tesseract` binary (expected to be on PATH —
+//! the UB-Mannheim installer adds it automatically) and parses the TSV output
+//! it writes to stdout. Using the system binary avoids the `ERROR_PATH_NOT_FOUND`
+//! that tauri-plugin-shell's sidecar spawn produces on Windows when the shell
+//! plugin sets an internal working directory that doesn't match the binary's
+//! expected DLL search paths.
 //!
-//! The sidecar binary must be placed at `src-tauri/binaries/` under the name
-//! `tesseract-<target-triple>` (e.g. `tesseract-x86_64-pc-windows-msvc.exe`),
-//! and tessdata must live at `src-tauri/binaries/tessdata/`.
-
-use tauri::{AppHandle, Manager};
-use tauri_plugin_shell::ShellExt;
+//! The `parse_tsv` function and `TesseractResult` type are shared with
+//! any future sidecar-based variant; only the spawn call changes here.
 
 /// Result returned to the frontend for each OCR'd frame.
 #[derive(serde::Serialize)]
@@ -24,42 +22,29 @@ pub struct TesseractResult {
 
 /// Run Tesseract on a single image file and return the extracted text with
 /// its mean confidence score.
+///
+/// Calls `tesseract <path> stdout tsv` on a blocking thread (OCR is CPU-bound
+/// and `std::process::Command::output()` is synchronous). Tesseract locates
+/// its `tessdata/` relative to its own executable, so no `--tessdata-dir` arg
+/// is required when using the system install.
 #[tauri::command]
 pub async fn tesseract_ocr_image(
-    app: AppHandle,
+    _app: tauri::AppHandle,
     path: String,
 ) -> Result<TesseractResult, String> {
-    // Resolve the tessdata directory from the app's resource directory.
-    // In dev mode this is `src-tauri/` (Tauri resolves resources there);
-    // in production it is the bundled resource dir next to the executable.
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Could not resolve resource dir: {e}"))?;
+    // Offload the blocking process::Command::output() call off the async executor.
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("tesseract")
+            .args([path.as_str(), "stdout", "tsv"])
+            .output()
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+    .map_err(|e| format!("Failed to run tesseract: {e}"))?;
 
-    // tessdata lives one level inside the resource dir.
-    let tessdata_dir = resource_dir.join("tessdata");
-    let tessdata_str = tessdata_dir.to_string_lossy().to_string();
-
-    // Run:  tesseract --tessdata-dir <dir> <image> stdout tsv
-    let output = app
-        .shell()
-        .sidecar("binaries/tesseract")
-        .map_err(|e| format!("Could not locate tesseract sidecar: {e}"))?
-        .args([
-            "--tessdata-dir",
-            &tessdata_str,
-            &path,
-            "stdout", // write to stdout instead of a file
-            "tsv",    // TSV config: gives per-word confidence column
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to spawn tesseract: {e}"))?;
-
-    // Tesseract writes progress/warnings to stderr even on success; only treat
-    // a non-zero exit code as a hard error.
-    if output.status.code() != Some(0) {
+    // Tesseract writes informational messages to stderr even on success; treat
+    // only a non-zero exit code as a hard error.
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "Tesseract exited with code {:?}: {}",
