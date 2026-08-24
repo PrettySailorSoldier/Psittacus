@@ -1,0 +1,187 @@
+.container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 24px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.header {
+  margin-bottom: 12px;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.subtitle {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* The stage centres the preview and gives it the remaining vertical space. */
+.stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  overflow: hidden;
+}
+
+.loading,
+.error {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  line-height: 1.6;
+}
+
+.error {
+  color: var(--danger);
+}
+
+/*
+ * Shrink-to-fit wrapper: the overlay and selection box are positioned against
+ * this, so it must match the rendered image exactly rather than the stage.
+ */
+.imageWrap {
+  position: relative;
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  line-height: 0;
+}
+
+.image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* Transparent drag target covering the image; new rectangles start here. */
+.surface {
+  position: absolute;
+  inset: 0;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.selection {
+  position: absolute;
+  border: 1px solid var(--accent-hover);
+  /* The huge spread shadow dims everything outside the selection, so the
+     excluded reader chrome is visually obvious before confirming. */
+  box-shadow: 0 0 0 9999px rgba(15, 15, 19, 0.68);
+  background: rgba(124, 92, 191, 0.08);
+  cursor: move;
+  touch-action: none;
+}
+
+.handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--accent-hover);
+  border: 1px solid var(--bg-base);
+  border-radius: 2px;
+  touch-action: none;
+}
+
+.handle_nw { top: -5px; left: -5px; cursor: nwse-resize; }
+.handle_n  { top: -5px; left: calc(50% - 5px); cursor: ns-resize; }
+.handle_ne { top: -5px; right: -5px; cursor: nesw-resize; }
+.handle_e  { top: calc(50% - 5px); right: -5px; cursor: ew-resize; }
+.handle_se { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.handle_s  { bottom: -5px; left: calc(50% - 5px); cursor: ns-resize; }
+.handle_sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.handle_w  { top: calc(50% - 5px); left: -5px; cursor: ew-resize; }
+
+.readout {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-top: 10px;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.dim {
+  color: var(--text-muted);
+}
+
+.actionBar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.rightActions {
+  display: flex;
+  gap: 12px;
+}
+
+.ghostBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  transition: all 0.2s;
+}
+
+.ghostBtn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.primaryBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  transition: all 0.2s;
+}
+
+.primaryBtn:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.ghostBtn:disabled,
+.primaryBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

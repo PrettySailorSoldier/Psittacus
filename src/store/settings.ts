@@ -43,3 +43,48 @@ export async function saveSettings(settings: Settings): Promise<void> {
     console.error('Failed to save settings:', error);
   }
 }
+
+// ── Last-used crop region ────────────────────────────────────────────────────
+// Kept out of `Settings` deliberately: it is resolution-dependent state tied to
+// whichever reader window was last recorded, not a user preference, and it has
+// no sensible default to merge against.
+
+import type { CropRegion } from '../lib/cropFrames';
+
+const CROP_REGION_KEY = 'lastCropRegion';
+
+/**
+ * Load the crop region from the previous run, or null if there is none.
+ *
+ * Most users record the same reader window at the same size over and over, so
+ * restoring the last rectangle means the crop step is a single confirm click
+ * after the first time.
+ */
+export async function loadCropRegion(): Promise<CropRegion | null> {
+  try {
+    const s = await getStore();
+    const saved = await s.get<CropRegion>(CROP_REGION_KEY);
+    if (
+      saved &&
+      typeof saved.x === 'number' && typeof saved.y === 'number' &&
+      typeof saved.width === 'number' && typeof saved.height === 'number' &&
+      saved.width > 0 && saved.height > 0
+    ) {
+      return saved;
+    }
+    return null;
+  } catch (error) {
+    console.error('Failed to load crop region:', error);
+    return null;
+  }
+}
+
+export async function saveCropRegion(region: CropRegion): Promise<void> {
+  try {
+    const s = await getStore();
+    await s.set(CROP_REGION_KEY, region);
+    await s.save();
+  } catch (error) {
+    console.error('Failed to save crop region:', error);
+  }
+}
