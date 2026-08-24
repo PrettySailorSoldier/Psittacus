@@ -1,4 +1,6 @@
+import { invoke } from '@tauri-apps/api/core';
 import { deduplicateText } from './dedup';
+
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = 'llava';

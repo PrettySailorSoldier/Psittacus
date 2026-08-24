@@ -1,4 +1,5 @@
 mod recording;
+mod tesseract_ocr;
 
 use recording::RecordingState;
 use tauri::{Manager, RunEvent};
@@ -16,6 +17,7 @@ pub fn run() {
             recording::start_recording,
             recording::stop_recording,
             recording::discard_recording,
+            tesseract_ocr::tesseract_ocr_image,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

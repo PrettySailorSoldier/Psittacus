@@ -55,6 +55,11 @@
           "name": "binaries/ffprobe",
           "sidecar": true,
           "args": true
+        },
+        {
+          "name": "binaries/tesseract",
+          "sidecar": true,
+          "args": true
         }
       ]
     }
