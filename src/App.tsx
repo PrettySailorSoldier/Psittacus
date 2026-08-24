@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { tempDir, join } from '@tauri-apps/api/path';
 import { mkdir, remove } from '@tauri-apps/plugin-fs';
@@ -7,6 +8,7 @@ import { mkdir, remove } from '@tauri-apps/plugin-fs';
 
 import TitleBar from './components/TitleBar/TitleBar';
 import DropZone from './components/DropZone/DropZone';
+import RecordButton from './components/RecordButton/RecordButton';
 import ControlPanel from './components/ControlPanel/ControlPanel';
 import ProgressView from './components/ProgressView/ProgressView';
 import OutputView from './components/OutputView/OutputView';
@@ -15,7 +17,7 @@ import { Settings, loadSettings, saveSettings } from './store/settings';
 import { getVideoDuration, extractFrames } from './lib/ffmpeg';
 import { runOcrPipeline } from './lib/ocr';
 
-export type AppState = 'idle' | 'ready' | 'processing' | 'done';
+export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'done';
 
 export interface FileInfo {
   path: string;
@@ -30,6 +32,9 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [progress, setProgress] = useState({ current: 0, total: 0, lastSnippet: '' });
   const [output, setOutput] = useState<{ text: string; wordCount: number; frameCount: number } | null>(null);
+  // Path of the current screen recording, if the loaded file came from one.
+  // Tracked so it can be cleaned up after a successful run.
+  const [recordingPath, setRecordingPath] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings().then(setSettings);
@@ -99,13 +104,16 @@ export default function App() {
     }
   };
 
-  const handleRun = async () => {
-    if (!file || !settings) return;
-    
+  // The pipeline itself is identical for imported and recorded video. Only the
+  // origin differs, and that determines whether the source file is a temporary
+  // recording we should clean up afterwards.
+  const runPipeline = async (target: FileInfo, isTempRecording = false) => {
+    if (!settings) return;
+
     setAppState('processing');
-    
+
     try {
-      const estimatedTotal = Math.ceil(file.duration / settings.sampleInterval);
+      const estimatedTotal = Math.ceil(target.duration / settings.sampleInterval);
       setProgress({ current: 0, total: estimatedTotal, lastSnippet: 'Extracting frames...' });
 
       // Create a unique temp directory
@@ -115,8 +123,8 @@ export default function App() {
       await mkdir(frameDir, { recursive: true });
 
       // 1. Extract frames
-      const framePaths = await extractFrames(file.path, frameDir, settings.sampleInterval);
-      
+      const framePaths = await extractFrames(target.path, frameDir, settings.sampleInterval);
+
       setProgress({ current: 0, total: framePaths.length, lastSnippet: 'Starting OCR...' });
 
       // 2. Run OCR Pipeline
@@ -147,6 +155,19 @@ export default function App() {
       // Cleanup
       await remove(frameDir, { recursive: true });
 
+      // A screen recording is a scratch file in the app cache; the OCR text is
+      // the deliverable, so drop it once the run has fully succeeded. On
+      // failure it is deliberately left in place (see catch) rather than
+      // silently discarded.
+      if (isTempRecording) {
+        try {
+          await invoke('discard_recording', { path: target.path });
+          setRecordingPath(null);
+        } catch (cleanupError) {
+          console.warn('Could not remove temporary recording:', cleanupError);
+        }
+      }
+
     } catch (error) {
       console.error(error);
       alert('An error occurred during processing.');
@@ -154,9 +175,52 @@ export default function App() {
     }
   };
 
+  const handleRun = async () => {
+    if (!file) return;
+    await runPipeline(file, file.path === recordingPath);
+  };
+
+  const showError = (title: string, msg: string) => {
+    import('@tauri-apps/plugin-dialog').then(({ message }) =>
+      message(msg, { title, kind: 'error' })
+    );
+  };
+
+  const handleRecordingStart = () => setAppState('recording');
+
+  const handleRecordingStop = async (filePath: string) => {
+    try {
+      const name = filePath.split(/[\\/]/).pop() || 'Screen Recording';
+      const duration = await getVideoDuration(filePath);
+      const recorded: FileInfo = {
+        path: filePath,
+        name,
+        size: 'Screen recording',
+        duration,
+      };
+
+      setRecordingPath(filePath);
+      setFile(recorded);
+
+      // Straight into the same extraction + OCR pipeline an import would take.
+      await runPipeline(recorded, true);
+    } catch (e) {
+      console.error('handleRecordingStop error:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setAppState('idle');
+      showError('Recording Error', `The recording finished but could not be read:\n${msg}\n\nThe file is still at:\n${filePath}`);
+    }
+  };
+
+  const handleRecordingError = (msg: string) => {
+    setAppState('idle');
+    showError('Recording Error', msg);
+  };
+
   const handleReset = () => {
     setFile(null);
     setOutput(null);
+    setRecordingPath(null);
     setProgress({ current: 0, total: 0, lastSnippet: '' });
     setAppState('idle');
   };
@@ -177,6 +241,15 @@ export default function App() {
             onFileDrop={processFile}
             onClick={appState === 'idle' ? handleManualOpen : undefined}
             onClear={handleReset}
+          />
+        )}
+
+        {(appState === 'idle' || appState === 'recording') && (
+          <RecordButton
+            isRecording={appState === 'recording'}
+            onStart={handleRecordingStart}
+            onStop={handleRecordingStop}
+            onError={handleRecordingError}
           />
         )}
 
