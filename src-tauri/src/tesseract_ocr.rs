@@ -59,11 +59,11 @@ pub async fn tesseract_ocr_image(
 
     // Tesseract writes progress/warnings to stderr even on success; only treat
     // a non-zero exit code as a hard error.
-    if output.status.code != Some(0) {
+    if output.status.code() != Some(0) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "Tesseract exited with code {:?}: {}",
-            output.status.code,
+            output.status.code(),
             stderr.trim()
         ));
     }
