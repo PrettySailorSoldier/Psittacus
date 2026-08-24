@@ -14,7 +14,9 @@ import RecordButton from './components/RecordButton/RecordButton';
 
 import { Settings, loadSettings, saveSettings } from './store/settings';
 import { getVideoDuration, extractFrames } from './lib/ffmpeg';
-import { runOcrPipeline } from './lib/ocr';
+import { dedupeFrames } from './lib/frameDedup';
+// runOcrPipeline kept as an unused manual fallback (llava-only mode)
+import { runOcrPipeline as _runOcrPipeline, runHybridOcrPipeline } from './lib/ocr';
 
 export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'done';
 
@@ -129,11 +131,15 @@ export default function App() {
       // 1. Extract frames via ffmpeg
       const framePaths = await extractFrames(file.path, frameDir, settings.sampleInterval);
 
-      setProgress({ current: 0, total: framePaths.length, lastSnippet: 'Starting OCR...' });
+      // 2. Deduplicate near-identical consecutive frames before OCR
+      setProgress({ current: 0, total: framePaths.length, lastSnippet: 'Deduplicating frames...' });
+      const dedupedPaths = await dedupeFrames(framePaths);
+      console.log(`[OCR] frames extracted: ${framePaths.length}, after dedup: ${dedupedPaths.length}`);
 
-      // 2. Run OCR pipeline frame-by-frame
-      const finalResult = await runOcrPipeline(
-        framePaths,
+      // 3. Run hybrid OCR pipeline (Tesseract primary, llava fallback)
+      setProgress({ current: 0, total: dedupedPaths.length, lastSnippet: 'Starting OCR...' });
+      const finalResult = await runHybridOcrPipeline(
+        dedupedPaths,
         settings.language,
         settings.dedupeThreshold,
         (frameIndex, text) => {

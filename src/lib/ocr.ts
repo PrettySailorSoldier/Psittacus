@@ -127,3 +127,125 @@ export async function runOcrPipeline(
     framesFailed,
   };
 }
+
+// ── Hybrid pipeline (Tesseract primary, llava fallback) ───────────────────────
+
+/** Minimum mean per-word Tesseract confidence (0–100) to accept its result. */
+const TESSERACT_CONFIDENCE_THRESHOLD = 60;
+
+/** Shape of the result returned by the Rust tesseract_ocr_image command. */
+interface TesseractCommandResult {
+  text: string;
+  confidence: number;
+}
+
+/** Extended result for the hybrid pipeline — distinguishes engine sources. */
+export interface HybridOcrResult {
+  text: string;
+  /** Total frames that entered the OCR loop (already deduped). */
+  framesProcessed: number;
+  /** Frames that produced any non-empty text from either engine. */
+  framesWithText: number;
+  /** Frames handled successfully by Tesseract alone. */
+  framesViaTesseract: number;
+  /** Frames where Tesseract was low-confidence and llava succeeded as fallback. */
+  framesViaLlava: number;
+  /** Frames where both engines failed (e.g. Tesseract error + Ollama down). */
+  framesFailedEntirely: number;
+}
+
+/**
+ * Run OCR on `framePaths` using Tesseract as the primary engine.
+ *
+ * Per-frame logic:
+ *   1. Invoke `tesseract_ocr_image` (Tauri command → bundled sidecar).
+ *   2. If confidence ≥ threshold AND text is non-empty → accept, skip llava.
+ *   3. If confidence is low OR text is empty → fall back to `ocrImage()` (llava).
+ *   4. If llava also fails → log clearly, count the frame as entirely failed.
+ *
+ * `runOcrPipeline` (llava-only) is intentionally left in place as a manual
+ * fallback in case the Tesseract sidecar is unavailable.
+ */
+export async function runHybridOcrPipeline(
+  framePaths: string[],
+  language: string,
+  dedupeThreshold: number,
+  onFrameDone: (frameIndex: number, text: string) => void
+): Promise<HybridOcrResult> {
+  const framesText: string[] = [];
+  let framesWithText = 0;
+  let framesViaTesseract = 0;
+  let framesViaLlava = 0;
+  let framesFailedEntirely = 0;
+
+  console.log(`[OCR] frames to process: ${framePaths.length}`);
+
+  for (let i = 0; i < framePaths.length; i++) {
+    const label = `${i + 1}/${framePaths.length}`;
+    let text = '';
+
+    // ── Step 1: Tesseract ────────────────────────────────────────────────────
+    let tResult: TesseractCommandResult | null = null;
+    try {
+      tResult = await invoke<TesseractCommandResult>('tesseract_ocr_image', {
+        path: framePaths[i],
+      });
+    } catch (e) {
+      console.warn(`[OCR] frame ${label}: tesseract invocation error —`, e);
+    }
+
+    const tesseractAccepted =
+      tResult !== null &&
+      tResult.confidence >= TESSERACT_CONFIDENCE_THRESHOLD &&
+      tResult.text.trim().length > 0;
+
+    if (tesseractAccepted && tResult) {
+      text = tResult.text;
+      framesViaTesseract++;
+      console.log(
+        `[OCR] frame ${label}: tesseract (confidence: ${tResult.confidence.toFixed(1)})`
+      );
+    } else {
+      // ── Step 2: llava fallback ─────────────────────────────────────────────
+      if (tResult !== null) {
+        // Tesseract ran but confidence was too low (or returned no text)
+        console.log(
+          `[OCR] frame ${label}: tesseract low-confidence ` +
+          `(${tResult.confidence.toFixed(1)}), falling back to llava`
+        );
+      } else {
+        // Tesseract failed to run at all (sidecar missing / spawn error)
+        console.log(`[OCR] frame ${label}: tesseract unavailable, falling back to llava`);
+      }
+
+      try {
+        text = await ocrImage(framePaths[i], language);
+        framesViaLlava++;
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        console.error(`[OCR] frame ${label}: both engines failed — ${reason}`);
+        framesFailedEntirely++;
+        // text stays '' — push the empty string to keep indices aligned
+      }
+    }
+
+    if (text.trim().length > 0) framesWithText++;
+    framesText.push(text);
+    onFrameDone(i, text);
+  }
+
+  console.log(
+    `[OCR] done — tesseract: ${framesViaTesseract}, ` +
+    `llava fallback: ${framesViaLlava}, ` +
+    `failed: ${framesFailedEntirely}`
+  );
+
+  return {
+    text: deduplicateText(framesText, dedupeThreshold),
+    framesProcessed: framesText.length,
+    framesWithText,
+    framesViaTesseract,
+    framesViaLlava,
+    framesFailedEntirely,
+  };
+}
