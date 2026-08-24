@@ -141,13 +141,17 @@ export default function App() {
         }
       );
 
-      const wordCount = finalResult.split(/\s+/).filter(Boolean).length;
-      const uniqueFrames = finalResult.split('\n\n---\n\n').length;
+      const wordCount = finalResult.text.split(/\s+/).filter(Boolean).length;
 
       setOutput({
-        text: finalResult,
+        text: finalResult.text,
         wordCount,
-        frameCount: uniqueFrames
+        // Count of frames actually put through OCR, tallied inside the OCR
+        // loop. This used to be derived from the deduped string, which meant
+        // an empty result reported "1 frames" (''.split(sep).length === 1)
+        // and a static screen recording reported its deduped block count
+        // rather than how many frames were read.
+        frameCount: finalResult.framesProcessed
       });
       
       setAppState('done');
@@ -170,8 +174,9 @@ export default function App() {
 
     } catch (error) {
       console.error(error);
-      alert('An error occurred during processing.');
+      const msg = error instanceof Error ? error.message : String(error);
       setAppState('ready');
+      showError('Processing Error', msg);
     }
   };
 
