@@ -93,7 +93,7 @@ pub async fn start_recording(
 
     let command = app
         .shell()
-        .sidecar("binaries/ffmpeg")
+        .sidecar("ffmpeg")
         .map_err(|e| format!("Could not locate the ffmpeg sidecar: {e}"))?
         .args([
             "-f",

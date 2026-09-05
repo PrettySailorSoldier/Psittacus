@@ -47,17 +47,17 @@
       "identifier": "shell:allow-execute",
       "allow": [
         {
-          "name": "binaries/ffmpeg",
+          "name": "ffmpeg",
           "sidecar": true,
           "args": true
         },
         {
-          "name": "binaries/ffprobe",
+          "name": "ffprobe",
           "sidecar": true,
           "args": true
         },
         {
-          "name": "binaries/tesseract",
+          "name": "tesseract",
           "sidecar": true,
           "args": true
         }

@@ -33,9 +33,9 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/ffmpeg",
-      "binaries/ffprobe",
-      "binaries/tesseract"
+      "ffmpeg",
+      "ffprobe",
+      "tesseract"
     ],
     "resources": {
       "binaries/tessdata": "tessdata"
