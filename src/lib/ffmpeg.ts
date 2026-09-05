@@ -1,7 +1,7 @@
 import { Command } from '@tauri-apps/plugin-shell';
 
 export async function getVideoDuration(videoPath: string): Promise<number> {
-  const cmd = Command.sidecar('binaries/ffprobe', [
+  const cmd = Command.sidecar('ffprobe', [
     '-v',
     'error',
     '-show_entries',
@@ -34,7 +34,7 @@ export async function extractFrames(
   const cleanOutputDir = outputDir.replace(/[\\/]$/, '');
   const pattern = `${cleanOutputDir}/frame_%04d.png`;
 
-  const cmd = Command.sidecar('binaries/ffmpeg', [
+  const cmd = Command.sidecar('ffmpeg', [
     '-i',
     videoPath,
     '-vf',
