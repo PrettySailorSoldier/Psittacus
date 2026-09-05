@@ -262,7 +262,7 @@ export default function App() {
   return (
     <>
       <TitleBar />
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minHeight: 0, minWidth: 0 }}>
 
         {(appState === 'idle' || appState === 'ready') && (
           <DropZone
