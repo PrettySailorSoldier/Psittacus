@@ -19,11 +19,16 @@ const MIN_SIZE = 16;
 interface CropSelectorProps {
   /** Path of the frame shown as the drag reference (the first deduped frame). */
   framePath: string;
-  /** Region restored from the previous run, if any. */
-  initialRegion: CropRegion | null;
+  /**
+   * Fetch the region saved by a previous run, given the size of the frame now
+   * on screen. Takes the frame size because a stored rectangle is only
+   * meaningful against the frame it was drawn on - the caller declines to
+   * return one that came from a differently sized capture.
+   */
+  loadInitialRegion: (frameWidth: number, frameHeight: number) => Promise<CropRegion | null>;
   /** Number of frames the confirmed crop will be applied to - shown as context. */
   frameCount: number;
-  onConfirm: (region: CropRegion) => void;
+  onConfirm: (region: CropRegion, frameWidth: number, frameHeight: number) => void;
   onSkip: () => void;
 }
 
@@ -51,7 +56,7 @@ function regionFromPoints(ax: number, ay: number, bx: number, by: number): CropR
 
 export default function CropSelector({
   framePath,
-  initialRegion,
+  loadInitialRegion,
   frameCount,
   onConfirm,
   onSkip,
@@ -68,8 +73,12 @@ export default function CropSelector({
    * The crop rectangle, always stored in NATIVE frame pixels. Keeping native
    * (rather than CSS) coordinates in state means a window resize rescales the
    * drawn box instead of corrupting the region it represents.
+   *
+   * Starts empty and is filled in from the previous run only once the frame's
+   * own size is known, since that is what decides whether the stored rectangle
+   * still applies.
    */
-  const [region, setRegion] = useState<CropRegion | null>(initialRegion);
+  const [region, setRegion] = useState<CropRegion | null>(null);
 
   const imgRef = useRef<HTMLImageElement | null>(null);
   const dragRef = useRef<DragMode | null>(null);
@@ -242,7 +251,19 @@ export default function CropSelector({
               draggable={false}
               onLoad={e => {
                 const el = e.currentTarget;
-                setNatural({ w: el.naturalWidth, h: el.naturalHeight });
+                const w = el.naturalWidth;
+                const h = el.naturalHeight;
+                setNatural({ w, h });
+                // Only now is it possible to tell whether the stored region was
+                // drawn against a frame of this size. A drag started before this
+                // resolves wins: never overwrite a rectangle the user is drawing.
+                loadInitialRegion(w, h)
+                  .then(saved => {
+                    if (saved && !dragRef.current) {
+                      setRegion(prev => prev ?? saved);
+                    }
+                  })
+                  .catch(err => console.warn('[Crop] could not restore region:', err));
               }}
             />
 
@@ -311,7 +332,10 @@ export default function CropSelector({
 
           <button
             className={styles.primaryBtn}
-            onClick={() => region && natural && onConfirm(clampRegion(region, natural.w, natural.h))}
+            onClick={() =>
+              region && natural &&
+              onConfirm(clampRegion(region, natural.w, natural.h), natural.w, natural.h)
+            }
             disabled={!isUsable}
           >
             <Check size={16} /> Confirm crop

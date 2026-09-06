@@ -43,6 +43,8 @@
     "store:allow-get",
     "store:allow-set",
     "store:allow-save",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     {
       "identifier": "shell:allow-execute",
       "allow": [

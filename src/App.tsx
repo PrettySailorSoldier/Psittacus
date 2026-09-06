@@ -52,13 +52,9 @@ export default function App() {
   // selector every time the pipeline touches unrelated state.
   const cropResolver = useRef<((region: CropRegion | null) => void) | null>(null);
   const [cropPrompt, setCropPrompt] = useState<{ framePath: string; frameCount: number } | null>(null);
-  // Last-used region, restored from the store so repeat recordings of the same
-  // reader window are a single confirm click.
-  const [cropRegion, setCropRegion] = useState<CropRegion | null>(null);
 
   useEffect(() => {
     loadSettings().then(setSettings);
-    loadCropRegion().then(setCropRegion);
   }, []);
 
   const handleSettingsChange = (newSettings: Settings) => {
@@ -188,8 +184,6 @@ export default function App() {
         const region = await askForCropRegion(dedupedPaths[0], dedupedPaths.length);
 
         if (region) {
-          setCropRegion(region);
-          saveCropRegion(region); // fire-and-forget: a failed save is not fatal
           setProgress({ current: 0, total: dedupedPaths.length, lastSnippet: 'Cropping frames...' });
           ocrPaths = await cropFrames(dedupedPaths, region, (done, total) => {
             setProgress({ current: done, total, lastSnippet: `Cropping frame ${done}/${total}...` });
@@ -297,8 +291,12 @@ export default function App() {
           <CropSelector
             framePath={cropPrompt.framePath}
             frameCount={cropPrompt.frameCount}
-            initialRegion={cropRegion}
-            onConfirm={region => finishCropStep(region)}
+            loadInitialRegion={loadCropRegion}
+            onConfirm={(region, frameWidth, frameHeight) => {
+              // Fire-and-forget: a failed save costs a redraw next run, not this one.
+              saveCropRegion(region, frameWidth, frameHeight);
+              finishCropStep(region);
+            }}
             onSkip={() => finishCropStep(null)}
           />
         )}

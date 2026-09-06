@@ -36,29 +36,104 @@ pub struct RecordingState {
     inner: Mutex<Option<ActiveRecording>>,
 }
 
-/// Returns the (ffmpeg input format, input spec) pair for this platform.
+/// Bounds of the monitor showing the app, as gdigrab wants them:
+/// `(offset_x, offset_y, width, height)`.
+///
+/// gdigrab's `desktop` input grabs the *virtual* desktop — every monitor
+/// stitched into one bitmap — so on a multi-monitor machine a plain desktop
+/// capture drags in whatever happens to be on the other screens. Restricting
+/// the grab to one monitor is what keeps a second display's icons, taskbar and
+/// unrelated windows out of the recording in the first place, rather than
+/// leaving it to the crop step to cut them back out.
 #[cfg(target_os = "windows")]
-fn capture_input(window_target: Option<String>) -> Result<(&'static str, String), String> {
-    let input = match window_target.as_deref().map(str::trim) {
-        Some(t) if !t.is_empty() => format!("title={}", t),
-        _ => "desktop".to_string(),
+fn monitor_capture_region(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    Ok(("gdigrab", input))
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    let hwnd = app.get_webview_window("main")?.hwnd().ok()?;
+
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+
+    let rect = info.rcMonitor;
+    let width = u32::try_from(rect.right - rect.left).ok()?;
+    let height = u32::try_from(rect.bottom - rect.top).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    // The desktop bitmap's origin is the top-left of the *virtual* screen,
+    // which is only (0, 0) when no monitor sits above or left of the primary.
+    // Offsets are relative to that origin, not to absolute desktop coordinates.
+    let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+
+    Some((rect.left - origin_x, rect.top - origin_y, width, height))
+}
+
+/// Returns the ffmpeg input format, input spec, and any args that must precede
+/// `-i` (the region flags) for this platform.
+#[cfg(target_os = "windows")]
+fn capture_input(
+    app: &AppHandle,
+    window_target: Option<String>,
+) -> Result<(&'static str, String, Vec<String>), String> {
+    if let Some(title) = window_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        // gdigrab crops to the window itself, so no region flags are needed.
+        return Ok(("gdigrab", format!("title={title}"), Vec::new()));
+    }
+
+    // Falls back to the whole virtual desktop if the monitor geometry can't be
+    // read — an over-wide recording beats no recording at all.
+    let region = match monitor_capture_region(app) {
+        Some((x, y, w, h)) => vec![
+            "-offset_x".to_string(),
+            x.to_string(),
+            "-offset_y".to_string(),
+            y.to_string(),
+            "-video_size".to_string(),
+            format!("{w}x{h}"),
+        ],
+        None => Vec::new(),
+    };
+
+    Ok(("gdigrab", "desktop".to_string(), region))
 }
 
 #[cfg(target_os = "linux")]
-fn capture_input(window_target: Option<String>) -> Result<(&'static str, String), String> {
+fn capture_input(
+    _app: &AppHandle,
+    window_target: Option<String>,
+) -> Result<(&'static str, String, Vec<String>), String> {
     // x11grab addresses displays/regions rather than window titles, so
     // window_target is treated as a raw display spec (e.g. ":0.0+100,200").
     let input = match window_target.as_deref().map(str::trim) {
         Some(t) if !t.is_empty() => t.to_string(),
         _ => std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string()),
     };
-    Ok(("x11grab", input))
+    Ok(("x11grab", input, Vec::new()))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn capture_input(_window_target: Option<String>) -> Result<(&'static str, String), String> {
+fn capture_input(
+    _app: &AppHandle,
+    _window_target: Option<String>,
+) -> Result<(&'static str, String, Vec<String>), String> {
     Err("Screen recording is only supported on Windows and Linux.".to_string())
 }
 
@@ -87,37 +162,41 @@ pub async fn start_recording(
         return Err("A recording is already in progress.".to_string());
     }
 
-    let (format, input) = capture_input(window_target)?;
+    let (format, input, region) = capture_input(&app, window_target)?;
     let output_path = timestamped_output(&app)?;
     let output_arg = output_path.to_string_lossy().to_string();
+
+    // Built as owned strings because the region flags are computed at runtime.
+    let mut args = vec!["-f".to_string(), format.to_string()];
+    // The region flags are input options, so they have to land before `-i`.
+    args.extend(region);
+    args.extend([
+        "-framerate".to_string(),
+        CAPTURE_FRAMERATE.to_string(),
+        "-i".to_string(),
+        input,
+        // gdigrab/x11grab can hand back odd dimensions, which yuv420p rejects.
+        "-vf".to_string(),
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "ultrafast".to_string(),
+        // Fairly high quality: these frames are going to an OCR model, and
+        // compression artifacts on small text cost accuracy.
+        "-crf".to_string(),
+        "18".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-y".to_string(),
+        output_arg,
+    ]);
 
     let command = app
         .shell()
         .sidecar("ffmpeg")
         .map_err(|e| format!("Could not locate the ffmpeg sidecar: {e}"))?
-        .args([
-            "-f",
-            format,
-            "-framerate",
-            CAPTURE_FRAMERATE,
-            "-i",
-            &input,
-            // gdigrab/x11grab can hand back odd dimensions, which yuv420p rejects.
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            // Fairly high quality: these frames are going to an OCR model, and
-            // compression artifacts on small text cost accuracy.
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-            &output_arg,
-        ]);
+        .args(args);
 
     let (mut events, child) = command
         .spawn()
