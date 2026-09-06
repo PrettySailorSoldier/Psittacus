@@ -132,6 +132,13 @@ export async function cropFrame(framePath: string, region: CropRegion): Promise<
  * A frame that fails to crop falls back to its original path rather than
  * dropping out of the run — a bit of leftover UI chrome on one frame beats
  * losing that page's text entirely.
+ *
+ * Every frame failing is a different matter, and is not survivable by falling
+ * back: it means canvas or the filesystem is unusable, and the fallback quietly
+ * hands OCR the very full-screen frames the user cropped to avoid. That reads
+ * downstream as "the crop was ignored" — the run completes, the progress bar
+ * fills, and the transcript is full of the chrome they excluded. Surfacing the
+ * real error costs the run but names the cause.
  */
 export async function cropFrames(
   framePaths: string[],
@@ -139,20 +146,32 @@ export async function cropFrames(
   onProgress?: (done: number, total: number) => void
 ): Promise<string[]> {
   const out: string[] = [];
+  let failures = 0;
+  let firstFailure: Error | null = null;
 
   for (let i = 0; i < framePaths.length; i++) {
     try {
       out.push(await cropFrame(framePaths[i], region));
     } catch (e) {
+      failures++;
+      if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));
       console.warn(`[Crop] frame ${i + 1}/${framePaths.length}: crop failed, using original:`, e);
       out.push(framePaths[i]);
     }
     onProgress?.(i + 1, framePaths.length);
   }
 
+  if (firstFailure && failures === framePaths.length) {
+    throw new Error(
+      `Cropping failed on all ${framePaths.length} frame(s), so OCR would have run on ` +
+      `the full screen instead of the selected region. First failure: ${firstFailure.message}`
+    );
+  }
+
   console.log(
-    `[Crop] cropped ${out.length} frame(s) to ` +
-    `${region.width}×${region.height} at (${region.x}, ${region.y})`
+    `[Crop] cropped ${out.length - failures}/${out.length} frame(s) to ` +
+    `${region.width}×${region.height} at (${region.x}, ${region.y})` +
+    (failures > 0 ? ` — ${failures} fell back to the full frame` : '')
   );
 
   return out;

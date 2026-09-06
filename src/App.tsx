@@ -220,7 +220,12 @@ export default function App() {
 
     } catch (error) {
       console.error(error);
-      showError('An error occurred during processing.');
+      // The message matters: the failures worth reporting here (a crop that
+      // could not be written, an OCR backend that is down) each need a
+      // different fix, and a bare "an error occurred" names none of them.
+      showError(
+        `Processing failed:\n${error instanceof Error ? error.message : String(error)}`
+      );
       setAppState('ready');
     } finally {
       // Always clean up temp frames, even on error

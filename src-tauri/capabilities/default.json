@@ -35,6 +35,10 @@
       "identifier": "fs:allow-read-file",
       "allow": ["$TEMP", "$TEMP/**"]
     },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": ["$TEMP", "$TEMP/**"]
+    },
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",
