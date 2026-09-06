@@ -16,6 +16,10 @@ use tokio::sync::oneshot;
 
 /// How long we wait for ffmpeg to finalize the mp4 after being asked to quit.
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a freshly spawned ffmpeg is given to reject its own arguments.
+/// Long enough to catch an input it refuses to open, short enough that it is
+/// not felt as lag on the Record button.
+const STARTUP_GRACE: Duration = Duration::from_millis(600);
 /// Capture rate. The pipeline samples at most 1fps, so this is plenty and it
 /// keeps the CPU cost of the capture itself low.
 const CAPTURE_FRAMERATE: &str = "15";
@@ -50,9 +54,6 @@ fn monitor_capture_region(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    };
 
     let hwnd = app.get_webview_window("main")?.hwnd().ok()?;
 
@@ -73,13 +74,12 @@ fn monitor_capture_region(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
         return None;
     }
 
-    // The desktop bitmap's origin is the top-left of the *virtual* screen,
-    // which is only (0, 0) when no monitor sits above or left of the primary.
-    // Offsets are relative to that origin, not to absolute desktop coordinates.
-    let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-
-    Some((rect.left - origin_x, rect.top - origin_y, width, height))
+    // gdigrab checks offset_x/offset_y against the virtual desktop in absolute
+    // coordinates, which run negative for a monitor above or left of the
+    // primary. `rcMonitor` is already in exactly that space, so it is passed
+    // through as-is — normalising it to a (0, 0) origin puts the capture area
+    // outside the desktop bounds and ffmpeg refuses to open the input.
+    Some((rect.left, rect.top, width, height))
 }
 
 /// Returns the ffmpeg input format, input spec, and any args that must precede
@@ -239,6 +239,23 @@ pub async fn start_recording(
             let _ = tx.send(None);
         }
     });
+
+    // ffmpeg validates its input options only after it has been spawned, so a
+    // rejected capture region looks like a *successful* start followed by an
+    // immediate exit. Without this pause the UI would sit on a running timer
+    // recording nothing, and the failure would not surface until Stop — with
+    // the whole session already lost. Better to fail here, while the user can
+    // still act on it.
+    tokio::time::sleep(STARTUP_GRACE).await;
+
+    let mut exit_rx = exit_rx;
+    if let Ok(code) = exit_rx.try_recv() {
+        let tail = log.lock().unwrap().join("\n");
+        return Err(match code {
+            Some(c) => format!("ffmpeg exited immediately with code {c}.\n{tail}"),
+            None => format!("ffmpeg exited immediately.\n{tail}"),
+        });
+    }
 
     *state.inner.lock().unwrap() = Some(ActiveRecording {
         child,
