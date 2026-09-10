@@ -173,6 +173,10 @@ pub async fn start_recording(
     args.extend([
         "-framerate".to_string(),
         CAPTURE_FRAMERATE.to_string(),
+        "-thread_queue_size".to_string(),
+        "512".to_string(),
+        "-use_wallclock_as_timestamps".to_string(),
+        "1".to_string(),
         "-i".to_string(),
         input,
         // gdigrab/x11grab can hand back odd dimensions, which yuv420p rejects.
