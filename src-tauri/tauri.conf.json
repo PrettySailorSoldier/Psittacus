@@ -34,11 +34,10 @@
     ],
     "externalBin": [
       "ffmpeg",
-      "ffprobe",
-      "tesseract"
+      "ffprobe"
     ],
     "resources": {
-      "binaries/tessdata": "tessdata"
+      "binaries/tesseract": "tesseract"
     }
   }
 }

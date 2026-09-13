@@ -1,13 +1,32 @@
 //! Tesseract OCR via `std::process::Command`.
 //!
-//! Spawns the system-installed `tesseract` binary and parses the TSV output
-//! it writes to stdout into a plain text string plus a mean confidence score.
+//! Spawns Tesseract and parses the TSV output it writes to stdout into a plain
+//! text string plus a mean confidence score.
 //!
-//! Using `std::process::Command` (rather than the tauri-plugin-shell sidecar
-//! machinery) gives us full control over executable resolution. On Windows,
-//! `STATUS_DLL_NOT_FOUND (0xC0000135)` can occur when the binary is found
-//! through a PATH shim and the loader doesn't register the exe's own directory
-//! as DLL search location #1. Resolving to the full absolute path avoids that.
+//! Psittacus ships its own Tesseract — the executable, the ~55 DLLs it is
+//! dynamically linked against, and a tessdata directory — as a bundled
+//! resource, so OCR works on a machine with nothing installed. A system install
+//! is still used as a fallback if the bundled copy is ever missing.
+//!
+//! WHY NOT `externalBin`/sidecar: the Tesseract build is dynamically linked and
+//! its DLLs must sit in the same directory as the exe, but `externalBin` stages
+//! a single file. Shipping the whole directory as a resource and launching it by
+//! ABSOLUTE path is what makes it load: the Windows loader uses the exe's own
+//! directory as DLL search location #1 only when the process is started that
+//! way. A PATH-shim lookup skips that step and produces
+//! `STATUS_DLL_NOT_FOUND (0xC0000135)` — which is exactly what the bare
+//! executable does on its own, with no DLLs beside it.
+
+use tauri::Manager;
+
+/// Windows: run the child without allocating a console.
+///
+/// Release builds set `windows_subsystem = "windows"`, so the app has no console
+/// of its own and each `Command` spawn would otherwise pop a console window —
+/// once per frame, i.e. hundreds of times in a single run. Debug builds keep a
+/// console, which is why this stays invisible under `tauri dev`.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Result returned to the frontend for each OCR'd frame.
 #[derive(serde::Serialize)]
@@ -19,21 +38,42 @@ pub struct TesseractResult {
     pub confidence: f32,
 }
 
+/// A usable Tesseract: the executable, plus the tessdata directory to pass
+/// explicitly when it is the bundled copy (a system install finds its own).
+struct TesseractInstall {
+    exe: std::path::PathBuf,
+    tessdata: Option<std::path::PathBuf>,
+}
+
 /// Run Tesseract on a single image file and return the extracted text with
 /// its mean confidence score.
 ///
-/// Calls `tesseract <path> stdout tsv` on a blocking thread (OCR is CPU-bound
-/// and `std::process::Command::output()` is synchronous).
+/// Calls `tesseract <path> stdout [--tessdata-dir <dir>] tsv` on a blocking
+/// thread (OCR is CPU-bound and `std::process::Command::output()` is
+/// synchronous).
 #[tauri::command]
 pub async fn tesseract_ocr_image(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     path: String,
 ) -> Result<TesseractResult, String> {
+    let install = resolve_tesseract(&app);
+
     let output = tauri::async_runtime::spawn_blocking(move || {
-        let exe = resolve_tesseract_exe();
-        std::process::Command::new(&exe)
-            .args([path.as_str(), "stdout", "tsv"])
-            .output()
+        let mut cmd = std::process::Command::new(&install.exe);
+        cmd.arg(&path).arg("stdout");
+        // Must precede the `tsv` config file argument.
+        if let Some(dir) = &install.tessdata {
+            cmd.arg("--tessdata-dir").arg(dir);
+        }
+        cmd.arg("tsv");
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        cmd.output()
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
@@ -54,12 +94,54 @@ pub async fn tesseract_ocr_image(
     parse_tsv(&tsv)
 }
 
-/// Locate the `tesseract` executable, preferring an absolute path.
+/// Locate Tesseract, preferring the copy shipped with the app.
+fn resolve_tesseract(app: &tauri::AppHandle) -> TesseractInstall {
+    bundled_tesseract(app).unwrap_or_else(|| TesseractInstall {
+        exe: resolve_system_tesseract_exe(),
+        // A system install reads its own tessdata; overriding it with ours
+        // would only risk a traineddata/engine version mismatch.
+        tessdata: None,
+    })
+}
+
+/// The Tesseract shipped in the app's resources, if it is complete.
 ///
-/// On Windows, an absolute path is critical: the Windows DLL loader uses the
-/// executable's own directory as its first DLL search location only when the
-/// process is started with an absolute path. A PATH-shim lookup can skip that
-/// step, producing `STATUS_DLL_NOT_FOUND (0xC0000135)` for co-located DLLs.
+/// `configs/tsv` is checked rather than just the executable because its absence
+/// fails silently in the worst possible way: Tesseract ignores the unrecognised
+/// config argument, prints PLAIN TEXT instead of TSV, and still exits 0.
+/// `parse_tsv` then finds no word rows and reports empty text at 0.0
+/// confidence, so every frame looks low-confidence and is routed to the llava
+/// fallback — a slow, mysterious run instead of an error. Falling back to a
+/// system install is far better than shipping into that.
+fn bundled_tesseract(app: &tauri::AppHandle) -> Option<TesseractInstall> {
+    let dir = app.path().resource_dir().ok()?.join("tesseract");
+
+    let exe = dir.join(if cfg!(windows) { "tesseract.exe" } else { "tesseract" });
+    let tessdata = dir.join("tessdata");
+
+    if !exe.exists() {
+        eprintln!(
+            "[tesseract] no bundled copy at {}; falling back to a system install",
+            exe.display()
+        );
+        return None;
+    }
+    if !tessdata.join("configs").join("tsv").exists() {
+        eprintln!(
+            "[tesseract] bundled copy at {} is missing tessdata/configs/tsv; \
+             falling back to a system install",
+            dir.display()
+        );
+        return None;
+    }
+
+    Some(TesseractInstall {
+        exe,
+        tessdata: Some(tessdata),
+    })
+}
+
+/// Locate a system-installed `tesseract`, preferring an absolute path.
 ///
 /// Resolution order (Windows):
 ///   1. Parent of `TESSDATA_PREFIX` env var (set by the UB-Mannheim installer)
@@ -67,7 +149,7 @@ pub async fn tesseract_ocr_image(
 ///   3. `C:\Program Files (x86)\Tesseract-OCR\tesseract.exe`
 ///   4. `%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe` (user install)
 ///   5. `"tesseract"` — relies on PATH (Linux / macOS / unknown Windows layout)
-fn resolve_tesseract_exe() -> std::path::PathBuf {
+fn resolve_system_tesseract_exe() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         // Strategy 1: TESSDATA_PREFIX is set by the UB-Mannheim installer and
