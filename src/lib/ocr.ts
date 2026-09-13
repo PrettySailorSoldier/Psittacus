@@ -181,6 +181,12 @@ export interface HybridOcrResult {
   framesViaTesseract: number;
   /** Frames where Tesseract was low-confidence and llava succeeded as fallback. */
   framesViaLlava: number;
+  /**
+   * Frames kept from low-confidence Tesseract output because the llava
+   * fallback was unreachable. Text was still produced; treat a high count as a
+   * sign that the fallback is misconfigured, not that the run failed.
+   */
+  framesViaLowConfidenceTesseract: number;
   /** Frames where both engines failed (e.g. Tesseract error + Ollama down). */
   framesFailedEntirely: number;
 }
@@ -207,8 +213,13 @@ export async function runHybridOcrPipeline(
   let framesWithText = 0;
   let framesViaTesseract = 0;
   let framesViaLlava = 0;
+  let framesViaLowConfidenceTesseract = 0;
   let framesFailedEntirely = 0;
   let firstFailure: Error | null = null;
+  // Why Tesseract was passed over, kept so a total failure can name the
+  // first-line cause instead of only the fallback's symptom.
+  let firstTesseractError: string | null = null;
+  let firstRejection: string | null = null;
 
   console.log(`[OCR] frames to process: ${framePaths.length}`);
 
@@ -224,6 +235,7 @@ export async function runHybridOcrPipeline(
       });
     } catch (e) {
       console.warn(`[OCR] frame ${label}: tesseract invocation error —`, e);
+      if (!firstTesseractError) firstTesseractError = e instanceof Error ? e.message : String(e);
     }
 
     const tesseractAccepted =
@@ -250,6 +262,13 @@ export async function runHybridOcrPipeline(
       // ── Step 2: llava fallback ─────────────────────────────────────────────
       if (tResult !== null) {
         // Tesseract ran but confidence was too low (or returned no text)
+        const words = tResult.text.trim().split(/\s+/).filter(Boolean).length;
+        if (!firstRejection) {
+          firstRejection =
+            `ran, but frame ${label} scored ${tResult.confidence.toFixed(1)} ` +
+            `against a threshold of ${TESSERACT_CONFIDENCE_THRESHOLD} ` +
+            `(${words} word${words === 1 ? '' : 's'} read)`;
+        }
         console.log(
           `[OCR] frame ${label}: tesseract low-confidence ` +
           `(${tResult.confidence.toFixed(1)}), falling back to llava`
@@ -264,10 +283,26 @@ export async function runHybridOcrPipeline(
         framesViaLlava++;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        console.error(`[OCR] frame ${label}: both engines failed — ${reason}`);
-        framesFailedEntirely++;
         if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));
-        // text stays '' — push the empty string to keep indices aligned
+
+        // The fallback is gone, so low-confidence Tesseract output is now the
+        // best available reading of this frame — keep it. Discarding it here
+        // was strictly worse than imperfect text: a frame Tesseract had
+        // actually read came out blank purely because the second opinion was
+        // unreachable, and a run where llava is not installed lost every
+        // below-threshold frame rather than degrading.
+        if (tResult !== null && tResult.text.trim().length > 0) {
+          text = tResult.text;
+          framesViaLowConfidenceTesseract++;
+          console.warn(
+            `[OCR] frame ${label}: llava unavailable (${reason}); ` +
+            `keeping low-confidence tesseract text (${tResult.confidence.toFixed(1)})`
+          );
+        } else {
+          console.error(`[OCR] frame ${label}: both engines failed — ${reason}`);
+          framesFailedEntirely++;
+          // text stays '' — push the empty string to keep indices aligned
+        }
       }
     }
 
@@ -279,15 +314,37 @@ export async function runHybridOcrPipeline(
   console.log(
     `[OCR] done — tesseract: ${framesViaTesseract}, ` +
     `llava fallback: ${framesViaLlava}, ` +
+    `low-confidence tesseract kept: ${framesViaLowConfidenceTesseract}, ` +
     `failed: ${framesFailedEntirely}`
   );
 
-  // Every frame failing both engines means Tesseract is missing AND Ollama is
-  // unreachable — not that the video had no text. `runOcrPipeline` already
-  // guards this; without the same guard here the run "succeeds" into an empty
-  // transcript and the real cause is only visible in the console.
+  // Every frame failing both engines means Tesseract was passed over AND the
+  // llava fallback is unusable — not that the video had no text. `runOcrPipeline`
+  // already guards this; without the same guard here the run "succeeds" into an
+  // empty transcript and the real cause is only visible in the console.
+  //
+  // The report names BOTH layers. Throwing only the fallback's error blamed
+  // llava ("model 'llava' not found") for a run that llava was never meant to
+  // handle, and said nothing about why Tesseract — the engine that should have
+  // done the work — was skipped on every frame.
   if (framesFailedEntirely === framePaths.length && firstFailure) {
-    throw firstFailure;
+    const tesseractStatus = firstTesseractError
+      ? `could not be started — ${firstTesseractError}`
+      : firstRejection
+        ? firstRejection
+        : 'was not used';
+
+    throw new OcrBackendError(
+      `OCR produced nothing on all ${framePaths.length} frame(s).\n\n` +
+      `Tesseract (primary): ${tesseractStatus}.\n` +
+      `llava (fallback): ${firstFailure.message}\n\n` +
+      (firstRejection
+        ? 'A very low confidence with few or no words usually means the cropped ' +
+          'area did not contain readable text — check the crop region before ' +
+          'changing engines.'
+        : 'Fix the primary engine first; the fallback is only meant for frames ' +
+          'Tesseract reads poorly.')
+    );
   }
 
   return {
@@ -297,6 +354,7 @@ export async function runHybridOcrPipeline(
     framesWithText,
     framesViaTesseract,
     framesViaLlava,
+    framesViaLowConfidenceTesseract,
     framesFailedEntirely,
   };
 }

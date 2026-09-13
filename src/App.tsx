@@ -166,6 +166,12 @@ export default function App() {
     const frameDir = await join(tempPath, `psittacus_run_${runId}`);
     await mkdir(frameDir, { recursive: true });
 
+    // Gates discarding the source recording. A run that throws must leave the
+    // mp4 alone: it is the only copy, the user cannot re-record what was on
+    // screen, and the failure they just hit is usually one they can fix and
+    // retry (a model that needs pulling, a crop that selected the wrong area).
+    let succeeded = false;
+
     try {
       // 1. Extract frames via ffmpeg
       const framePaths = await extractFrames(file.path, frameDir, settings.sampleInterval);
@@ -217,6 +223,7 @@ export default function App() {
         frameTexts: finalResult.frameTexts,
       });
       setAppState('done');
+      succeeded = true;
 
     } catch (error) {
       console.error(error);
@@ -234,8 +241,11 @@ export default function App() {
       } catch (e) {
         console.warn('Failed to clean up temp frames:', e);
       }
-      // Discard the cached recording mp4 if this run came from a screen recording
-      if (recordingPath) {
+      // Discard the cached recording mp4 only once its text has actually been
+      // extracted. Discarding on failure too made every failed run destroy the
+      // source: the retry then died in ffmpeg with "No such file or directory",
+      // which names the deletion rather than the problem that caused it.
+      if (succeeded && recordingPath) {
         try {
           await invoke('discard_recording', { path: recordingPath });
         } catch (e) {
