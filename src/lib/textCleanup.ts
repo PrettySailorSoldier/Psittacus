@@ -199,6 +199,7 @@ export async function cleanupExtractedText(
   console.log(`[Cleanup] ${rawFrameTexts.length} frame(s) -> ${chunks.length} chunk(s), model=${CLEANUP_MODEL}`);
 
   const cleaned: string[] = [];
+  let failures = 0;
   let firstFailure: Error | null = null;
 
   for (let i = 0; i < chunks.length; i++) {
@@ -211,6 +212,7 @@ export async function cleanupExtractedText(
       cleaned.push(out.length > 0 ? out : chunks[i]);
       console.log(`[Cleanup] chunk ${i + 1}/${chunks.length}: ${chunks[i].length} -> ${out.length} chars`);
     } catch (e) {
+      failures++;
       if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));
       console.error(`[Cleanup] chunk ${i + 1}/${chunks.length} failed, keeping raw text:`, e);
       cleaned.push(chunks[i]);
@@ -222,8 +224,11 @@ export async function cleanupExtractedText(
   // Every chunk failing means the backend is unreachable or the model is
   // missing. Returning the raw text unchanged would look like "cleanup ran and
   // found nothing to fix", so surface the real reason instead.
-  if (firstFailure && cleaned.length === chunks.length &&
-      cleaned.every((c, i) => c === chunks[i])) {
+  // Counted, not inferred by comparing output to input: a model that correctly
+  // returns an already-clean chunk unchanged is indistinguishable from a failed
+  // one by content alone, so the old check both fired on successful runs and
+  // stayed silent when some chunks failed and others came back empty.
+  if (firstFailure && failures === chunks.length) {
     throw firstFailure;
   }
 

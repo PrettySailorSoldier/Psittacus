@@ -208,6 +208,7 @@ export async function runHybridOcrPipeline(
   let framesViaTesseract = 0;
   let framesViaLlava = 0;
   let framesFailedEntirely = 0;
+  let firstFailure: Error | null = null;
 
   console.log(`[OCR] frames to process: ${framePaths.length}`);
 
@@ -265,6 +266,7 @@ export async function runHybridOcrPipeline(
         const reason = e instanceof Error ? e.message : String(e);
         console.error(`[OCR] frame ${label}: both engines failed — ${reason}`);
         framesFailedEntirely++;
+        if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));
         // text stays '' — push the empty string to keep indices aligned
       }
     }
@@ -279,6 +281,14 @@ export async function runHybridOcrPipeline(
     `llava fallback: ${framesViaLlava}, ` +
     `failed: ${framesFailedEntirely}`
   );
+
+  // Every frame failing both engines means Tesseract is missing AND Ollama is
+  // unreachable — not that the video had no text. `runOcrPipeline` already
+  // guards this; without the same guard here the run "succeeds" into an empty
+  // transcript and the real cause is only visible in the console.
+  if (framesFailedEntirely === framePaths.length && firstFailure) {
+    throw firstFailure;
+  }
 
   return {
     text: deduplicateText(framesText, dedupeThreshold),
