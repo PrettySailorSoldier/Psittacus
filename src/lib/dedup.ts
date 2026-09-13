@@ -1,25 +1,50 @@
 
-// Another similarity metric could be word-based, but character-based is robust for OCR noise.
-// A more advanced approach uses Levenshtein distance, but Jaccard is faster for a quick check.
-// Let's implement a word-based Jaccard which is often better for actual text:
+// Single-word Jaccard was tried first but over-fires on real documents: two
+// different pages of the same book/article draw from the same small pool of
+// common and domain words, so their unique-word sets overlap 85%+ even when
+// every sentence differs. Once one page gets misjudged as a duplicate it drops
+// out, and — since comparisons anchor on the last *kept* frame, not the raw
+// previous one (see below) — every later page keeps getting compared against
+// that same first page, so a consistently-reused vocabulary can cascade into
+// dropping the entire rest of the document.
+//
+// Shingling (comparing runs of N consecutive words instead of lone words) is
+// the standard fix for this class of false positive: it only counts a match
+// when the *same phrase* recurs, not just the same words in any order. Two
+// different pages rarely share a run of 3 words verbatim; a genuinely
+// duplicated/static frame still matches almost all of its shingles.
+const SHINGLE_SIZE = 3;
+
+function shingles(text: string, n: number): Set<string> {
+  const words = text.toLowerCase().match(/\w+/g) || [];
+  if (words.length === 0) return new Set();
+  // Too short to form an n-gram — fall back to treating the whole thing as
+  // one unit rather than returning nothing (which would force similarity to 0
+  // no matter how alike two short frames are).
+  if (words.length < n) return new Set([words.join(' ')]);
+
+  const result = new Set<string>();
+  for (let i = 0; i <= words.length - n; i++) {
+    result.add(words.slice(i, i + n).join(' '));
+  }
+  return result;
+}
+
 function wordSimilarity(a: string, b: string): number {
-  const wordsA = a.toLowerCase().match(/\w+/g) || [];
-  const wordsB = b.toLowerCase().match(/\w+/g) || [];
+  const shinglesA = shingles(a, SHINGLE_SIZE);
+  const shinglesB = shingles(b, SHINGLE_SIZE);
 
-  if (wordsA.length === 0 && wordsB.length === 0) return 1;
-  if (wordsA.length === 0 || wordsB.length === 0) return 0;
-
-  const setA = new Set(wordsA);
-  const setB = new Set(wordsB);
+  if (shinglesA.size === 0 && shinglesB.size === 0) return 1;
+  if (shinglesA.size === 0 || shinglesB.size === 0) return 0;
 
   let intersectionSize = 0;
-  for (const word of setA) {
-    if (setB.has(word)) {
+  for (const shingle of shinglesA) {
+    if (shinglesB.has(shingle)) {
       intersectionSize++;
     }
   }
 
-  const unionSize = setA.size + setB.size - intersectionSize;
+  const unionSize = shinglesA.size + shinglesB.size - intersectionSize;
   return intersectionSize / unionSize;
 }
 
