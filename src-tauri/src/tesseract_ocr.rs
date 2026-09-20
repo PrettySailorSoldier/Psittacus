@@ -104,6 +104,37 @@ fn resolve_tesseract(app: &tauri::AppHandle) -> TesseractInstall {
     })
 }
 
+/// Strip Windows' `\\?\` verbatim prefix from a path.
+///
+/// `resource_dir()` hands back a canonicalised path, which on Windows carries
+/// the extended-length prefix. Tesseract builds the data file path by
+/// concatenating `--tessdata-dir` with `/eng.traineddata`, and Win32 does NOT
+/// normalise verbatim paths: that forward slash stays a literal filename
+/// character rather than a separator, so the open fails with
+/// `Error opening data file \\?\...\tessdata/eng.traineddata` and Tesseract
+/// exits 1 on every frame. A plain path goes through the usual normalisation.
+#[cfg(windows)]
+fn simplified(path: std::path::PathBuf) -> std::path::PathBuf {
+    let plain = {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            Some(std::path::PathBuf::from(format!(r"\\{rest}")))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            // Only a drive-letter path is safe to shorten; other verbatim
+            // forms (device paths) may genuinely need the prefix.
+            (rest.as_bytes().get(1) == Some(&b':')).then(|| std::path::PathBuf::from(rest))
+        } else {
+            None
+        }
+    };
+    plain.unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn simplified(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
+}
+
 /// The Tesseract shipped in the app's resources, if it is complete.
 ///
 /// `configs/tsv` is checked rather than just the executable because its absence
@@ -114,7 +145,7 @@ fn resolve_tesseract(app: &tauri::AppHandle) -> TesseractInstall {
 /// fallback — a slow, mysterious run instead of an error. Falling back to a
 /// system install is far better than shipping into that.
 fn bundled_tesseract(app: &tauri::AppHandle) -> Option<TesseractInstall> {
-    let dir = app.path().resource_dir().ok()?.join("tesseract");
+    let dir = simplified(app.path().resource_dir().ok()?).join("tesseract");
 
     let exe = dir.join(if cfg!(windows) { "tesseract.exe" } else { "tesseract" });
     let tessdata = dir.join("tessdata");
