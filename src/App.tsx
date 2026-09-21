@@ -214,10 +214,22 @@ export default function App() {
         }
       );
 
-      const wordCount = finalResult.text.split(/\s+/).filter(Boolean).length;
+      // Show the structured reconstruction rather than the flat transcript.
+      // It carries the same words plus the headings, paragraph breaks and
+      // dropped page furniture recovered from the OCR geometry, and already
+      // falls back to a frame's plain text wherever geometry was unavailable —
+      // so it is never less complete than `text`. The guard covers the case
+      // where no frame had geometry at all (every frame went to the vision
+      // fallback), which leaves the structured output empty.
+      const displayText =
+        finalResult.structuredText.trim().length > 0
+          ? finalResult.structuredText
+          : finalResult.text;
+
+      const wordCount = displayText.split(/\s+/).filter(Boolean).length;
 
       setOutput({
-        text: finalResult.text,
+        text: displayText,
         wordCount,
         frameCount: finalResult.framesProcessed,
         frameTexts: finalResult.frameTexts,

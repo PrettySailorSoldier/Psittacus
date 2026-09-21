@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { deduplicateText } from './dedup';
+import { structurePages } from './structure';
 
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
@@ -182,6 +183,20 @@ export interface OcrLineBox {
   height: number;
 }
 
+/**
+ * A frame's line geometry together with the frame's own dimensions.
+ *
+ * The dimensions travel with the lines because every structural question is
+ * relative to the page: whether a line sits in the bottom margin, whether it is
+ * centred, how wide the text block is. Absolute pixel coordinates answer none
+ * of those on their own.
+ */
+export interface OcrPageGeometry {
+  lines: OcrLineBox[];
+  imageWidth: number;
+  imageHeight: number;
+}
+
 /** Shape of the result returned by the Rust windows_ocr_image command. */
 interface WindowsOcrCommandResult {
   text: string;
@@ -204,20 +219,26 @@ export interface HybridOcrResult {
    */
   frameTexts: string[];
   /**
-   * Per-frame line geometry from the primary engine, in frame order, aligned
+   * Markdown reconstruction of the recording, with headings, paragraph breaks
+   * and page furniture resolved from the geometry. Deduplicated the same way
+   * `text` is.
+   *
+   * Falls back to the plain text of any frame the structure pass could not
+   * analyse, so this is never *less* complete than `text` — only better
+   * organised where the geometry allowed it.
+   */
+  structuredText: string;
+  /**
+   * Per-frame page geometry from the primary engine, in frame order, aligned
    * with `frameTexts`.
    *
-   * PLUMBED BUT NOT YET CONSUMED. This is the raw material for the structure
-   * pass — separating chapter titles, headings, body text and page numbers is
-   * a question about glyph height relative to the page median, position within
-   * the margins and centring, none of which survive flattening to a string.
-   * Carrying it through the pipeline now means that pass can be written
+   * Kept on the result so a caller can re-run or tune the structure pass
    * without re-running OCR over every frame.
    *
-   * Empty for any frame answered by the fallback: a vision model returns no
-   * trustworthy coordinates, so there is nothing honest to put here.
+   * Empty lines for any frame answered by the fallback: a vision model returns
+   * no trustworthy coordinates, so there is nothing honest to put here.
    */
-  frameLines: OcrLineBox[][];
+  framePages: OcrPageGeometry[];
   /** Total frames that entered the OCR loop (already deduped). */
   framesProcessed: number;
   /** Frames that produced any non-empty text from either engine. */
@@ -265,7 +286,7 @@ export async function runHybridOcrPipeline(
   onFrameDone: (frameIndex: number, text: string) => void
 ): Promise<HybridOcrResult> {
   const framesText: string[] = [];
-  const frameLines: OcrLineBox[][] = [];
+  const framePages: OcrPageGeometry[] = [];
   let framesWithText = 0;
   let framesViaWindowsOcr = 0;
   let framesViaVisionModel = 0;
@@ -282,7 +303,7 @@ export async function runHybridOcrPipeline(
   for (let i = 0; i < framePaths.length; i++) {
     const label = `${i + 1}/${framePaths.length}`;
     let text = '';
-    let lines: OcrLineBox[] = [];
+    let page: OcrPageGeometry = { lines: [], imageWidth: 0, imageHeight: 0 };
 
     // ── Step 1: Windows OCR ──────────────────────────────────────────────────
     let wResult: WindowsOcrCommandResult | null = null;
@@ -319,7 +340,7 @@ export async function runHybridOcrPipeline(
 
     if (primaryAccepted && wResult) {
       text = wResult.text;
-      lines = wResult.lines;
+      page = { lines: wResult.lines, imageWidth: wResult.imageWidth, imageHeight: wResult.imageHeight };
       framesViaWindowsOcr++;
     } else {
       // ── Step 2: vision model fallback ──────────────────────────────────────
@@ -347,7 +368,7 @@ export async function runHybridOcrPipeline(
         text = await ocrImage(framePaths[i], language);
         // Left empty deliberately: the vision model reports no geometry, and
         // fabricating boxes would poison the structure pass downstream.
-        lines = [];
+        page = { lines: [], imageWidth: 0, imageHeight: 0 };
         framesViaVisionModel++;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
@@ -361,7 +382,7 @@ export async function runHybridOcrPipeline(
         // below-threshold frame rather than degrading.
         if (wResult !== null && wResult.text.trim().length > 0) {
           text = wResult.text;
-          lines = wResult.lines;
+          page = { lines: wResult.lines, imageWidth: wResult.imageWidth, imageHeight: wResult.imageHeight };
           framesViaRejectedWindowsOcr++;
           console.warn(
             `[OCR] frame ${label}: ${OLLAMA_MODEL} unavailable (${reason}); ` +
@@ -377,7 +398,7 @@ export async function runHybridOcrPipeline(
 
     if (text.trim().length > 0) framesWithText++;
     framesText.push(text);
-    frameLines.push(lines);
+    framePages.push(page);
     onFrameDone(i, text);
   }
 
@@ -417,10 +438,23 @@ export async function runHybridOcrPipeline(
     );
   }
 
+  // Structure is recovered per frame and then deduplicated exactly as the
+  // plain text is, rather than being applied to the already-merged transcript.
+  // Dedup drops whole frames, so doing it in this order means the geometry and
+  // the text it describes are still talking about the same page.
+  //
+  // Frames the structure pass could not analyse (no geometry, i.e. answered by
+  // the vision fallback) keep their plain text, so nothing is ever dropped from
+  // the structured output that survives in the plain one.
+  const structuredFrames = structurePages(framePages).map(
+    (markdown, i) => (markdown.trim().length > 0 ? markdown : framesText[i])
+  );
+
   return {
     text: deduplicateText(framesText, dedupeThreshold),
+    structuredText: deduplicateText(structuredFrames, dedupeThreshold),
     frameTexts: framesText,
-    frameLines,
+    framePages,
     framesProcessed: framesText.length,
     framesWithText,
     framesViaWindowsOcr,

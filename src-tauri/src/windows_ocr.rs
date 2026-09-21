@@ -270,6 +270,9 @@ mod tests {
         };
 
         let result = recognize(&path).expect("OCR should succeed");
+        // Emitted so the frontend structure pass can be exercised against real
+        // engine geometry instead of hand-written fixtures.
+        eprintln!("JSON:{}", serde_json::to_string(&result).unwrap());
         eprintln!(
             "image={}x{} words={} plausibility={:.1}",
             result.image_width, result.image_height, result.word_count, result.confidence
