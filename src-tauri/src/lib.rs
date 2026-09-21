@@ -1,5 +1,6 @@
 mod recording;
 mod tesseract_ocr;
+mod windows_ocr;
 
 use recording::RecordingState;
 use tauri::{Manager, RunEvent};
@@ -33,6 +34,7 @@ pub fn run() {
             recording::stop_recording,
             recording::discard_recording,
             tesseract_ocr::tesseract_ocr_image,
+            windows_ocr::windows_ocr_image,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

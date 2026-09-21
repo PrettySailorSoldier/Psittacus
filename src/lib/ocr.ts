@@ -3,7 +3,18 @@ import { deduplicateText } from './dedup';
 
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
-const OLLAMA_MODEL = 'llava';
+/**
+ * Vision model used for the fallback leg.
+ *
+ * Was `llava` (LLaVA-1.5), whose vision tower is CLIP ViT-L at a fixed
+ * 336x336. A 1080p book page scaled to 336px puts body text below one pixel
+ * per stroke, so it could describe a page but not read one. qwen2.5vl uses
+ * native dynamic resolution — the image is tiled rather than squashed — which
+ * is what makes small print survive the encoder.
+ *
+ * Requires `ollama pull qwen2.5vl:7b` (~6 GB).
+ */
+const OLLAMA_MODEL = 'qwen2.5vl:7b';
 
 /** Raised when the OCR backend itself is unusable, as opposed to a frame simply having no text. */
 export class OcrBackendError extends Error {
@@ -128,39 +139,58 @@ export async function runOcrPipeline(
   };
 }
 
-// ── Hybrid pipeline (Tesseract primary, llava fallback) ───────────────────────
+// ── Hybrid pipeline (Windows OCR primary, qwen2.5vl fallback) ────────────────
 
 /**
- * Minimum mean per-word Tesseract confidence to accept its result, on
- * Tesseract's native 0–100 scale (matching `TesseractResult.confidence`,
- * which `parse_tsv` computes as the mean of the TSV `conf` column).
+ * Minimum plausibility score to accept the Windows OCR result, on the 0–100
+ * scale `windows_ocr.rs::plausibility` produces.
  *
- * Measured behaviour on clean printed textbook pages: mean confidence sits at
- * 94–96, with per-word values spread across 0–97. Nothing near this threshold.
- * That is why a normal run logs `decision=tesseract` on every frame and no
- * llava fallback lines appear — the gate is working, the input is just easy.
+ * IMPORTANT — this is NOT the same quantity the old Tesseract gate used, and
+ * the old threshold does not carry over. Tesseract reported a real per-word
+ * posterior from the recogniser. `Windows.Media.Ocr` exposes no confidence at
+ * all, so the Rust side derives a proxy from the returned strings: the share
+ * of words that look like language rather than symbol soup. Clean printed
+ * pages score a flat 100 (measured: a 123-word synthetic book page scored
+ * 100.0), so the useful threshold sits much higher than Tesseract's 60 — a
+ * frame dipping even to 80 means a fifth of the output is junk.
  *
- * The gate does fire on genuinely bad input: degrading a frame until Tesseract
- * can barely read it drops the mean to 55.6, and an unreadable frame reports
- * 0.0, both routing to llava.
- *
- * Raise this toward ~85 to push more borderline frames to llava (slower, but
- * llava handles low-res and handwriting far better); lower it toward ~40 to
- * keep more frames on Tesseract when llava is unavailable or too slow.
- *
- * CAVEAT — this score measures precision, not recall. Tesseract only reports
- * confidence for words it actually recognised; text it misses entirely never
- * enters the average. A blurred frame that yielded 7 words instead of 197
- * still scored 96.1 and was accepted. If messier source material starts going
- * through this pipeline, a low word count is the signal to watch, not a low
- * confidence — which is why the per-frame log below reports `words=` too.
+ * CAVEAT — the score measures precision, not recall, exactly as the Tesseract
+ * gate did. Text the engine never saw cannot drag down an average computed
+ * only from the text it returned, so a frame that yielded 6 words instead of
+ * 400 can still score 100. `wordCount` is what catches that, which is why the
+ * gate checks it below and the per-frame log reports it.
  */
-const TESSERACT_CONFIDENCE_THRESHOLD = 60;
+const PRIMARY_PLAUSIBILITY_THRESHOLD = 85;
 
-/** Shape of the result returned by the Rust tesseract_ocr_image command. */
-interface TesseractCommandResult {
+/**
+ * Below this many words a frame is sent to the fallback regardless of score,
+ * covering the recall blind spot above.
+ *
+ * Deliberately low: a legitimately sparse frame (a chapter opener, a page with
+ * one line on it) should not be dragged through a 6 GB model for no reason.
+ * This is meant to catch "the engine found almost nothing", not "this page is
+ * short".
+ */
+const PRIMARY_MIN_WORDS = 3;
+
+/** One recognised line and the union of its words' bounding boxes, in source-image pixels. */
+export interface OcrLineBox {
   text: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** Shape of the result returned by the Rust windows_ocr_image command. */
+interface WindowsOcrCommandResult {
+  text: string;
+  /** Plausibility proxy, not a recogniser confidence. See the threshold above. */
   confidence: number;
+  wordCount: number;
+  lines: OcrLineBox[];
+  imageWidth: number;
+  imageHeight: number;
 }
 
 /** Extended result for the hybrid pipeline — distinguishes engine sources. */
@@ -173,35 +203,60 @@ export interface HybridOcrResult {
    * than being replaced by any downstream transform.
    */
   frameTexts: string[];
+  /**
+   * Per-frame line geometry from the primary engine, in frame order, aligned
+   * with `frameTexts`.
+   *
+   * PLUMBED BUT NOT YET CONSUMED. This is the raw material for the structure
+   * pass — separating chapter titles, headings, body text and page numbers is
+   * a question about glyph height relative to the page median, position within
+   * the margins and centring, none of which survive flattening to a string.
+   * Carrying it through the pipeline now means that pass can be written
+   * without re-running OCR over every frame.
+   *
+   * Empty for any frame answered by the fallback: a vision model returns no
+   * trustworthy coordinates, so there is nothing honest to put here.
+   */
+  frameLines: OcrLineBox[][];
   /** Total frames that entered the OCR loop (already deduped). */
   framesProcessed: number;
   /** Frames that produced any non-empty text from either engine. */
   framesWithText: number;
-  /** Frames handled successfully by Tesseract alone. */
-  framesViaTesseract: number;
-  /** Frames where Tesseract was low-confidence and llava succeeded as fallback. */
-  framesViaLlava: number;
+  /** Frames handled successfully by Windows OCR alone. */
+  framesViaWindowsOcr: number;
+  /** Frames where Windows OCR was rejected and the vision model succeeded as fallback. */
+  framesViaVisionModel: number;
   /**
-   * Frames kept from low-confidence Tesseract output because the llava
-   * fallback was unreachable. Text was still produced; treat a high count as a
-   * sign that the fallback is misconfigured, not that the run failed.
+   * Frames kept from rejected Windows OCR output because the fallback was
+   * unreachable. Text was still produced; treat a high count as a sign that
+   * the fallback is misconfigured, not that the run failed.
    */
-  framesViaLowConfidenceTesseract: number;
-  /** Frames where both engines failed (e.g. Tesseract error + Ollama down). */
+  framesViaRejectedWindowsOcr: number;
+  /** Frames where both engines failed (e.g. no OCR language pack + Ollama down). */
   framesFailedEntirely: number;
 }
 
 /**
- * Run OCR on `framePaths` using Tesseract as the primary engine.
+ * Run OCR on `framePaths` using the built-in Windows recogniser as the primary
+ * engine.
  *
  * Per-frame logic:
- *   1. Invoke `tesseract_ocr_image` (Tauri command → bundled sidecar).
- *   2. If confidence ≥ threshold AND text is non-empty → accept, skip llava.
- *   3. If confidence is low OR text is empty → fall back to `ocrImage()` (llava).
- *   4. If llava also fails → log clearly, count the frame as entirely failed.
+ *   1. Invoke `windows_ocr_image` (Tauri command → `Windows.Media.Ocr`).
+ *   2. If plausibility ≥ threshold AND enough words were read → accept.
+ *   3. Otherwise fall back to `ocrImage()` (qwen2.5vl via Ollama).
+ *   4. If the fallback also fails → keep whatever the primary managed, or
+ *      count the frame as entirely failed if it managed nothing.
  *
- * `runOcrPipeline` (llava-only) is intentionally left in place as a manual
- * fallback in case the Tesseract sidecar is unavailable.
+ * WHY WINDOWS OCR IS PRIMARY rather than the stronger-sounding vision model:
+ * it is ~100x faster per frame, needs no model download or running server,
+ * and — the part that matters for reproducing a book's layout — it returns a
+ * bounding box per word. A vision model transcribes well but cannot tell you
+ * where on the page anything sat, so it cannot distinguish a heading from body
+ * text except by guessing from wording.
+ *
+ * Tesseract remains available as `tesseract_ocr_image` and is no longer in
+ * this path; `runOcrPipeline` (vision-model-only) is likewise still here as a
+ * manual escape hatch.
  */
 export async function runHybridOcrPipeline(
   framePaths: string[],
@@ -210,15 +265,16 @@ export async function runHybridOcrPipeline(
   onFrameDone: (frameIndex: number, text: string) => void
 ): Promise<HybridOcrResult> {
   const framesText: string[] = [];
+  const frameLines: OcrLineBox[][] = [];
   let framesWithText = 0;
-  let framesViaTesseract = 0;
-  let framesViaLlava = 0;
-  let framesViaLowConfidenceTesseract = 0;
+  let framesViaWindowsOcr = 0;
+  let framesViaVisionModel = 0;
+  let framesViaRejectedWindowsOcr = 0;
   let framesFailedEntirely = 0;
   let firstFailure: Error | null = null;
-  // Why Tesseract was passed over, kept so a total failure can name the
+  // Why the primary was passed over, kept so a total failure can name the
   // first-line cause instead of only the fallback's symptom.
-  let firstTesseractError: string | null = null;
+  let firstPrimaryError: string | null = null;
   let firstRejection: string | null = null;
 
   console.log(`[OCR] frames to process: ${framePaths.length}`);
@@ -226,77 +282,90 @@ export async function runHybridOcrPipeline(
   for (let i = 0; i < framePaths.length; i++) {
     const label = `${i + 1}/${framePaths.length}`;
     let text = '';
+    let lines: OcrLineBox[] = [];
 
-    // ── Step 1: Tesseract ────────────────────────────────────────────────────
-    let tResult: TesseractCommandResult | null = null;
+    // ── Step 1: Windows OCR ──────────────────────────────────────────────────
+    let wResult: WindowsOcrCommandResult | null = null;
     try {
-      tResult = await invoke<TesseractCommandResult>('tesseract_ocr_image', {
+      wResult = await invoke<WindowsOcrCommandResult>('windows_ocr_image', {
         path: framePaths[i],
       });
     } catch (e) {
-      console.warn(`[OCR] frame ${label}: tesseract invocation error —`, e);
-      if (!firstTesseractError) firstTesseractError = e instanceof Error ? e.message : String(e);
+      console.warn(`[OCR] frame ${label}: windows OCR invocation error —`, e);
+      if (!firstPrimaryError) firstPrimaryError = e instanceof Error ? e.message : String(e);
     }
 
-    const tesseractAccepted =
-      tResult !== null &&
-      tResult.confidence >= TESSERACT_CONFIDENCE_THRESHOLD &&
-      tResult.text.trim().length > 0;
+    // Both halves of the gate matter, for different failure modes: the score
+    // catches a frame read as garbage, the word count catches a frame the
+    // engine barely read at all (which scores high on the little it found).
+    const primaryAccepted =
+      wResult !== null &&
+      wResult.confidence >= PRIMARY_PLAUSIBILITY_THRESHOLD &&
+      wResult.wordCount >= PRIMARY_MIN_WORDS &&
+      wResult.text.trim().length > 0;
 
     // Unconditional per-frame decision log. Previously the accept path and the
     // fallback path each logged their own line, which made "no fallback lines
     // in the console" ambiguous between "the check never fires" and "the check
     // fires and always passes". One line per frame, always, removes that.
     console.log(
-      `[OCR] frame ${label}: tesseract confidence=` +
-      `${tResult ? tResult.confidence.toFixed(1) : 'n/a (invocation failed)'}, ` +
-      `threshold=${TESSERACT_CONFIDENCE_THRESHOLD}, ` +
-      `words=${tResult ? tResult.text.trim().split(/\s+/).filter(Boolean).length : 0}, ` +
-      `decision=${tesseractAccepted ? 'tesseract' : 'fallback'}`
+      `[OCR] frame ${label}: windows plausibility=` +
+      `${wResult ? wResult.confidence.toFixed(1) : 'n/a (invocation failed)'}, ` +
+      `threshold=${PRIMARY_PLAUSIBILITY_THRESHOLD}, ` +
+      `words=${wResult ? wResult.wordCount : 0}/${PRIMARY_MIN_WORDS}, ` +
+      `lines=${wResult ? wResult.lines.length : 0}, ` +
+      `decision=${primaryAccepted ? 'windows' : 'fallback'}`
     );
 
-    if (tesseractAccepted && tResult) {
-      text = tResult.text;
-      framesViaTesseract++;
+    if (primaryAccepted && wResult) {
+      text = wResult.text;
+      lines = wResult.lines;
+      framesViaWindowsOcr++;
     } else {
-      // ── Step 2: llava fallback ─────────────────────────────────────────────
-      if (tResult !== null) {
-        // Tesseract ran but confidence was too low (or returned no text)
-        const words = tResult.text.trim().split(/\s+/).filter(Boolean).length;
+      // ── Step 2: vision model fallback ──────────────────────────────────────
+      if (wResult !== null) {
+        // Windows OCR ran but the result did not clear the gate.
         if (!firstRejection) {
           firstRejection =
-            `ran, but frame ${label} scored ${tResult.confidence.toFixed(1)} ` +
-            `against a threshold of ${TESSERACT_CONFIDENCE_THRESHOLD} ` +
-            `(${words} word${words === 1 ? '' : 's'} read)`;
+            `ran, but frame ${label} scored ${wResult.confidence.toFixed(1)} ` +
+            `against a threshold of ${PRIMARY_PLAUSIBILITY_THRESHOLD} ` +
+            `(${wResult.wordCount} word${wResult.wordCount === 1 ? '' : 's'} read)`;
         }
         console.log(
-          `[OCR] frame ${label}: tesseract low-confidence ` +
-          `(${tResult.confidence.toFixed(1)}), falling back to llava`
+          `[OCR] frame ${label}: windows OCR rejected ` +
+          `(score ${wResult.confidence.toFixed(1)}, ${wResult.wordCount} words), ` +
+          `falling back to ${OLLAMA_MODEL}`
         );
       } else {
-        // Tesseract failed to run at all (sidecar missing / spawn error)
-        console.log(`[OCR] frame ${label}: tesseract unavailable, falling back to llava`);
+        // The command itself failed — no language pack, unreadable file, etc.
+        console.log(
+          `[OCR] frame ${label}: windows OCR unavailable, falling back to ${OLLAMA_MODEL}`
+        );
       }
 
       try {
         text = await ocrImage(framePaths[i], language);
-        framesViaLlava++;
+        // Left empty deliberately: the vision model reports no geometry, and
+        // fabricating boxes would poison the structure pass downstream.
+        lines = [];
+        framesViaVisionModel++;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
         if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));
 
-        // The fallback is gone, so low-confidence Tesseract output is now the
+        // The fallback is gone, so the rejected Windows OCR output is now the
         // best available reading of this frame — keep it. Discarding it here
-        // was strictly worse than imperfect text: a frame Tesseract had
+        // was strictly worse than imperfect text: a frame the primary had
         // actually read came out blank purely because the second opinion was
-        // unreachable, and a run where llava is not installed lost every
+        // unreachable, and a run where the model is not pulled lost every
         // below-threshold frame rather than degrading.
-        if (tResult !== null && tResult.text.trim().length > 0) {
-          text = tResult.text;
-          framesViaLowConfidenceTesseract++;
+        if (wResult !== null && wResult.text.trim().length > 0) {
+          text = wResult.text;
+          lines = wResult.lines;
+          framesViaRejectedWindowsOcr++;
           console.warn(
-            `[OCR] frame ${label}: llava unavailable (${reason}); ` +
-            `keeping low-confidence tesseract text (${tResult.confidence.toFixed(1)})`
+            `[OCR] frame ${label}: ${OLLAMA_MODEL} unavailable (${reason}); ` +
+            `keeping rejected windows OCR text (score ${wResult.confidence.toFixed(1)})`
           );
         } else {
           console.error(`[OCR] frame ${label}: both engines failed — ${reason}`);
@@ -308,13 +377,14 @@ export async function runHybridOcrPipeline(
 
     if (text.trim().length > 0) framesWithText++;
     framesText.push(text);
+    frameLines.push(lines);
     onFrameDone(i, text);
   }
 
   console.log(
-    `[OCR] done — tesseract: ${framesViaTesseract}, ` +
-    `llava fallback: ${framesViaLlava}, ` +
-    `low-confidence tesseract kept: ${framesViaLowConfidenceTesseract}, ` +
+    `[OCR] done — windows: ${framesViaWindowsOcr}, ` +
+    `${OLLAMA_MODEL} fallback: ${framesViaVisionModel}, ` +
+    `rejected windows text kept: ${framesViaRejectedWindowsOcr}, ` +
     `failed: ${framesFailedEntirely}`
   );
 
