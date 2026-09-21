@@ -3,13 +3,13 @@
  *
  * Reader recordings capture the whole application window, so every frame
  * carries the same UI chrome (sidebar navigation, page-turn arrows, chapter
- * labels) alongside the actual page. Tesseract reads that chrome on every
+ * labels) alongside the actual page. The OCR engine reads that chrome on every
  * single frame, which means the identical nav text is appended to the
  * transcript once per frame and survives text dedup because it is interleaved
  * with genuinely different page content.
  *
  * Cropping to the page rectangle removes the problem at the source: the
- * chrome is never rasterised into the image Tesseract sees.
+ * chrome is never rasterised into the image the OCR engine sees.
  *
  * This runs entirely in the renderer via `<canvas>` — no new Rust command.
  * Crop is applied to the *deduped* frame list: cropping cannot change which

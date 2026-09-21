@@ -388,43 +388,44 @@ export async function runHybridOcrPipeline(
     `failed: ${framesFailedEntirely}`
   );
 
-  // Every frame failing both engines means Tesseract was passed over AND the
-  // llava fallback is unusable — not that the video had no text. `runOcrPipeline`
+  // Every frame failing both engines means the primary was passed over AND the
+  // fallback is unusable — not that the video had no text. `runOcrPipeline`
   // already guards this; without the same guard here the run "succeeds" into an
   // empty transcript and the real cause is only visible in the console.
   //
-  // The report names BOTH layers. Throwing only the fallback's error blamed
-  // llava ("model 'llava' not found") for a run that llava was never meant to
-  // handle, and said nothing about why Tesseract — the engine that should have
-  // done the work — was skipped on every frame.
+  // The report names BOTH layers. Throwing only the fallback's error blamed the
+  // vision model for a run it was never meant to handle, and said nothing about
+  // why the primary — the engine that should have done the work — was skipped
+  // on every frame.
   if (framesFailedEntirely === framePaths.length && firstFailure) {
-    const tesseractStatus = firstTesseractError
-      ? `could not be started — ${firstTesseractError}`
+    const primaryStatus = firstPrimaryError
+      ? `could not be started — ${firstPrimaryError}`
       : firstRejection
         ? firstRejection
         : 'was not used';
 
     throw new OcrBackendError(
       `OCR produced nothing on all ${framePaths.length} frame(s).\n\n` +
-      `Tesseract (primary): ${tesseractStatus}.\n` +
-      `llava (fallback): ${firstFailure.message}\n\n` +
+      `Windows OCR (primary): ${primaryStatus}.\n` +
+      `${OLLAMA_MODEL} (fallback): ${firstFailure.message}\n\n` +
       (firstRejection
-        ? 'A very low confidence with few or no words usually means the cropped ' +
+        ? 'A very low score with few or no words usually means the cropped ' +
           'area did not contain readable text — check the crop region before ' +
           'changing engines.'
         : 'Fix the primary engine first; the fallback is only meant for frames ' +
-          'Tesseract reads poorly.')
+          'Windows OCR reads poorly.')
     );
   }
 
   return {
     text: deduplicateText(framesText, dedupeThreshold),
     frameTexts: framesText,
+    frameLines,
     framesProcessed: framesText.length,
     framesWithText,
-    framesViaTesseract,
-    framesViaLlava,
-    framesViaLowConfidenceTesseract,
+    framesViaWindowsOcr,
+    framesViaVisionModel,
+    framesViaRejectedWindowsOcr,
     framesFailedEntirely,
   };
 }

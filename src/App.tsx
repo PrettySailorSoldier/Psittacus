@@ -17,7 +17,7 @@ import { Settings, loadSettings, saveSettings, loadCropRegion, saveCropRegion } 
 import { getVideoDuration, extractFrames } from './lib/ffmpeg';
 import { dedupeFrames } from './lib/frameDedup';
 import { CropRegion, cropFrames } from './lib/cropFrames';
-// runOcrPipeline kept as an unused manual fallback (llava-only mode)
+// runOcrPipeline kept as an unused manual fallback (vision-model-only mode)
 import { runOcrPipeline as _runOcrPipeline, runHybridOcrPipeline } from './lib/ocr';
 
 export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'cropping' | 'done';
@@ -199,7 +199,7 @@ export default function App() {
         }
       }
 
-      // 4. Run hybrid OCR pipeline (Tesseract primary, llava fallback)
+      // 4. Run hybrid OCR pipeline (Windows OCR primary, qwen2.5vl fallback)
       setProgress({ current: 0, total: ocrPaths.length, lastSnippet: 'Starting OCR...' });
       const finalResult = await runHybridOcrPipeline(
         ocrPaths,
