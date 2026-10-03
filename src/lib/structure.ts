@@ -31,6 +31,7 @@ import type { OcrLineBox, OcrPageGeometry } from './ocr';
  *   callout    — emphasised text set slightly larger than body (a boxed rule)
  *   listItem   — one entry of a numbered, lettered or bulleted list
  *   sideText   — stray words beside the prose, e.g. text inside a figure
+ *   tocEntry   — a table-of-contents line ending in a page reference
  */
 export type LineRole =
   | 'title'
@@ -39,6 +40,7 @@ export type LineRole =
   | 'body'
   | 'callout'
   | 'listItem'
+  | 'tocEntry'
   | 'pageNumber'
   | 'runningHead'
   | 'sideText';
@@ -62,7 +64,7 @@ export interface PageStructure {
  * those clusters, well clear of both.
  */
 const TITLE_RATIO = 1.6;
-const HEADING_RATIO = 1.2;
+export const HEADING_RATIO = 1.2;
 
 /**
  * Fraction of page height at the top and bottom treated as margin, where
@@ -121,7 +123,18 @@ const CALLOUT_RATIO = 1.1;
  * subheadings are set bold-italic at body size (22px against 21px), so no
  * height threshold separates them from prose without also catching callouts.
  */
-const OUTLINE_MARKER = /^(?:[IVXLC]+|[A-Z]|\d{1,2})\.\s+\S/;
+const OUTLINE_MARKER = /^(?:[IVXLC]+|[A-Za-z]|\d{1,2})\.\s+\S/;
+
+/**
+ * A table-of-contents entry: ends in a page reference, "(p. 441)" or a dot
+ * leader run to a number. On a real chapter outline these were merged into
+ * run-on paragraphs ("… (p. 441) 4. No Movement of Goods Required (p. 442)")
+ * because consecutive entries sit as close together as lines of prose.
+ */
+const TOC_ENTRY = /(?:\(p{1,2}\.?\s*\d{1,4}(?:\s*[-–]\s*\d{1,4})?\)|\.{3,}\s*\d{1,4})\s*$/;
+
+/** Splits a line holding several entries, after each page reference. */
+const TOC_SPLIT = /(?<=\(p{1,2}\.?\s*\d{1,4}(?:\s*[-–]\s*\d{1,4})?\))\s+(?=\S)/;
 
 /** Longest line, in words, still treated as a subheading. */
 const SUBHEADING_MAX_WORDS = 12;
@@ -244,11 +257,12 @@ function collectRunningHeads(pages: OcrPageGeometry[], marginBand: number): Set<
   for (const page of pages) {
     const topBand = page.imageHeight * marginBand;
     const bottomBand = page.imageHeight * (1 - marginBand);
+    const edges = edgeLines(page.lines);
     const seen = new Set<string>();
 
     for (const line of page.lines) {
       const inMargin = line.top < topBand || line.top + line.height > bottomBand;
-      if (!inMargin) continue;
+      if (!inMargin && !edges.has(line)) continue;
       const key = normaliseMarginLine(line.text);
       // An all-digit line normalises to nothing; it is a folio, handled by
       // pattern rather than by repetition.
@@ -260,6 +274,29 @@ function collectRunningHeads(pages: OcrPageGeometry[], marginBand: number): Set<
 
   const minPages = Math.max(2, Math.ceil(pages.length * RUNNING_HEAD_FREQUENCY));
   return new Set([...counts].filter(([, n]) => n >= minPages).map(([key]) => key));
+}
+
+/**
+ * The topmost and bottommost lines of a page.
+ *
+ * NEEDED BECAUSE THE MARGIN BAND ASSUMES A TIGHT CROP. On a real run the crop
+ * left enough space above the page that "CHAPTER 14" and "SALES LAW: RISK OF
+ * LOSS AND WARRANTIES" sat below the top 8% on most frames, so neither was
+ * ever considered, and both were printed once per page. Whatever the crop,
+ * a running head is still the first line on its page.
+ *
+ * Being an edge line only makes a line a *candidate*; it still has to recur
+ * across the document, or read as a bare page number, to be dropped.
+ */
+function edgeLines<T extends OcrLineBox>(lines: T[]): Set<T> {
+  if (lines.length === 0) return new Set();
+  let top = lines[0];
+  let bottom = lines[0];
+  for (const line of lines) {
+    if (line.top < top.top) top = line;
+    if (line.top + line.height > bottom.top + bottom.height) bottom = line;
+  }
+  return new Set([top, bottom]);
 }
 
 /**
@@ -308,10 +345,12 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
   const bodyLeft = bodyLefts.length > 0 ? median(bodyLefts) : median(page.lines.map(l => l.left));
 
   let pageNumber: string | null = null;
+  const edges = edgeLines(page.lines);
 
   const lines: ClassifiedLine[] = page.lines.map(line => {
     const lineWords = words(line.text);
     const inMargin = line.top < topBand || line.top + line.height > bottomBand;
+    const atEdge = edges.has(line);
     const ratio = line.height / bodyHeight;
     const centre = line.left + line.width / 2;
     const isCentred =
@@ -324,7 +363,7 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
     // A margin line is only furniture if it also either reads as a folio or
     // recurs across the document. Everything else falls through and is judged
     // on its typography like any other line.
-    if (inMargin && lineWords.length <= MAX_FURNITURE_WORDS) {
+    if ((inMargin || atEdge) && lineWords.length <= MAX_FURNITURE_WORDS) {
       const wholeLine = folioCandidate(line.text);
       if (wholeLine !== null) {
         pageNumber ??= wholeLine;
@@ -333,8 +372,12 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
 
       // Running heads commonly carry the folio at one end: "142  THE SILENT
       // GLAIVE". Recover the number, then drop the whole line as furniture.
-      const edgeFolio =
-        folioCandidate(lineWords[0]) ?? folioCandidate(lineWords[lineWords.length - 1]);
+      // Margin band only: an edge line outside it is just as likely to be a
+      // numbered subheading ("4. No Movement of Goods Required") that happens
+      // to open the frame, and this test would throw it away.
+      const edgeFolio = inMargin
+        ? folioCandidate(lineWords[0]) ?? folioCandidate(lineWords[lineWords.length - 1])
+        : null;
       if (edgeFolio !== null) {
         pageNumber ??= edgeFolio;
         return { ...line, role: 'runningHead' };
@@ -345,16 +388,27 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
       }
     }
 
-    // ── Headings, by measurement ─────────────────────────────────────────────
-    if (ratio >= TITLE_RATIO) return { ...line, role: 'title' };
-    if (ratio >= HEADING_RATIO) return { ...line, role: 'heading' };
+    // ── Table of contents ────────────────────────────────────────────────────
+    // Ahead of the size tests: an outline entry set in capitals ("VI. TERMS
+    // (p. 461)") measures as a heading, and was rendered as one.
+    if (TOC_ENTRY.test(line.text)) return { ...line, role: 'tocEntry' };
 
-    // A short centred line sitting outside the body margin is a heading even
-    // when it is not set larger — small-caps chapter labels ("CHAPTER SEVEN")
-    // are typically set at or below body size and would otherwise read as a
-    // stray sentence in the middle of the prose.
-    if (isCentred && lineWords.length <= MAX_FURNITURE_WORDS && line.left > bodyLeft + bodyHeight) {
-      return { ...line, role: 'heading' };
+    // ── Headings, by measurement ─────────────────────────────────────────────
+    // A heading never starts in lowercase. Without this guard a paragraph's
+    // last word, alone on its line ("not.", "buyer."), was promoted to a
+    // heading on a real run.
+    const startsLowercase = /^[a-z]/.test(line.text.trim());
+    if (!startsLowercase) {
+      if (ratio >= TITLE_RATIO) return { ...line, role: 'title' };
+      if (ratio >= HEADING_RATIO) return { ...line, role: 'heading' };
+
+      // A short centred line sitting outside the body margin is a heading even
+      // when it is not set larger — small-caps chapter labels ("CHAPTER SEVEN")
+      // are typically set at or below body size and would otherwise read as a
+      // stray sentence in the middle of the prose.
+      if (isCentred && lineWords.length <= MAX_FURNITURE_WORDS && line.left > bodyLeft + bodyHeight) {
+        return { ...line, role: 'heading' };
+      }
     }
 
     return { ...line, role: 'body' };
@@ -394,6 +448,15 @@ function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
   if (!aligned) return;
 
   const ordinals = markers.map(l => markerOrdinal(l.text));
+
+  // A "1." read as "I." or "l." — the letter ordinal would be 9 or 12. When
+  // the next marker is 2 it can only have been a 1; repair the text as well,
+  // or the list renders as "I. … / 2. …".
+  if (ordinals.length >= 2 && ordinals[1] === 2 && /^[Il][.)]\s/.test(markers[0].text.trim())) {
+    ordinals[0] = 1;
+    markers[0].text = markers[0].text.trim().replace(/^[Il]/, '1');
+  }
+
   const allBullets = ordinals.every(o => o === null);
   const sequential = ordinals.every((o, i) => o !== null && (i === 0 || o === ordinals[i - 1]! + 1));
   if (!allBullets && !sequential) return;
@@ -411,6 +474,14 @@ function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
  * outline marker.
  */
 function refineBodyLines(lines: ClassifiedLine[], bodyHeight: number): void {
+  // ── Table of contents ──────────────────────────────────────────────────────
+  // One line ending in "(p. 12)" is a cross-reference in prose; a contents
+  // page has them line after line. The last page of a contents list can carry
+  // as few as two entries, so two is the bar.
+  if (lines.filter(l => l.role === 'tocEntry').length < 2) {
+    for (const line of lines) if (line.role === 'tocEntry') line.role = 'body';
+  }
+
   // ── Side text ──────────────────────────────────────────────────────────────
   const isProse = (l: ClassifiedLine) =>
     l.role === 'body' && words(l.text).length >= SIDE_TEXT_NEIGHBOUR_MIN_WORDS;
@@ -457,8 +528,9 @@ function refineBodyLines(lines: ClassifiedLine[], bodyHeight: number): void {
     const text = line.text.trim();
     if (!OUTLINE_MARKER.test(text)) return;
     if (words(text).length > SUBHEADING_MAX_WORDS) return;
-    // A heading does not end mid-sentence; a list entry or prose line does.
-    if (/[.,;:]$/.test(text)) return;
+    // A heading does not end mid-sentence or as a question; a list entry,
+    // prose line or numbered study question ("1. Who is a consignor?") does.
+    if (/[.,;:?!]$/.test(text)) return;
     if (line.width > widestBody * SUBHEADING_MAX_WIDTH) return;
 
     const previous = flow[i - 1];
@@ -515,6 +587,22 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
   let listItems: string[][] = [];
   let itemLeft = 0;
   let previous: ClassifiedLine | null = null;
+  // Index in `blocks` of a heading that a following line may continue.
+  let openHeading = -1;
+
+  // Contents entries: indent level from where each entry starts, so the
+  // outline's nesting survives (I. → A. → 1. → a.).
+  const tocLefts = clusterLefts(
+    structure.lines.filter(l => l.role === 'tocEntry').map(l => l.left),
+    bodyHeight * 0.7
+  );
+  let tocBlock: string[] = [];
+  const flushToc = () => {
+    if (tocBlock.length > 0) {
+      blocks.push(tocBlock.join('\n'));
+      tocBlock = [];
+    }
+  };
 
   const flushParagraph = () => {
     if (paragraph.length > 0) {
@@ -536,13 +624,43 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
     if (line.role === 'pageNumber' || line.role === 'runningHead' || line.role === 'sideText') continue;
     const text = line.text.trim();
 
-    if (line.role === 'title' || line.role === 'heading' || line.role === 'subheading') {
+    if (line.role === 'tocEntry') {
       flushParagraph();
       flushList();
-      blocks.push(`${headingPrefix(line)} ${text}`);
+      openHeading = -1;
+      const level = tocLefts.findIndex(left => Math.abs(left - line.left) <= bodyHeight * 0.7);
+      for (const entry of text.split(TOC_SPLIT)) {
+        tocBlock.push(`${'  '.repeat(Math.max(0, level))}- ${entry.trim()}`);
+      }
       previous = line;
       continue;
     }
+    flushToc();
+
+    if (line.role === 'title' || line.role === 'heading' || line.role === 'subheading') {
+      flushParagraph();
+      flushList();
+
+      // A title set over several lines ("Sales Law: / Risk of Loss and /
+      // Warranties") is one heading, not three. Continue the open heading
+      // when this line has the same role and follows within a line's height.
+      const continuesHeading =
+        openHeading >= 0 &&
+        previous !== null &&
+        previous.role === line.role &&
+        line.role !== 'subheading' &&
+        line.top - (previous.top + previous.height) <= previous.height;
+
+      if (continuesHeading) {
+        blocks[openHeading] += ` ${text}`;
+      } else {
+        blocks.push(`${headingPrefix(line)} ${text}`);
+        openHeading = blocks.length - 1;
+      }
+      previous = line;
+      continue;
+    }
+    openHeading = -1;
 
     const adjacent =
       previous !== null && line.top - (previous.top + previous.height) <= bodyHeight * PARAGRAPH_GAP_RATIO;
@@ -569,8 +687,12 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
     // in the measured textbook the rule statement sat 11px under the prose,
     // inside the normal paragraph spacing. The reverse is NOT a break on its
     // own, because a callout's final line can measure at body height.
+    // A callout also opens a sentence, so a tall line starting in lowercase is
+    // the tail of the paragraph before it ("…at that time or" / "not."), not
+    // the start of a rule statement.
     const indented = previous !== null && line.left > previous.left + bodyHeight * INDENT_RATIO;
-    const entersCallout = line.role === 'callout' && paragraphKind !== 'callout';
+    const entersCallout =
+      line.role === 'callout' && paragraphKind !== 'callout' && !/^[a-z]/.test(text);
     const continues = paragraph.length > 0 && adjacent && !indented && !entersCallout;
 
     if (!continues) {
@@ -584,7 +706,22 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
 
   flushParagraph();
   flushList();
+  flushToc();
   return blocks.join('\n\n');
+}
+
+/**
+ * Distinct left edges, ascending, with values within `tolerance` of each
+ * other merged. Each cluster's position is one indent level.
+ */
+function clusterLefts(lefts: number[], tolerance: number): number[] {
+  const clusters: number[] = [];
+  for (const left of [...lefts].sort((a, b) => a - b)) {
+    if (clusters.length === 0 || left - clusters[clusters.length - 1] > tolerance) {
+      clusters.push(left);
+    }
+  }
+  return clusters;
 }
 
 /**
@@ -600,6 +737,7 @@ function headingPrefix(line: ClassifiedLine): string {
   const marker = line.text.trim().split(/\s+/)[0];
   if (/^[IVXLC]{2,}\.$/.test(marker)) return '##';
   if (/^[A-Z]\.$/.test(marker)) return '###';
+  if (/^[a-z]\.$/.test(marker)) return '#####';
   return '####';
 }
 

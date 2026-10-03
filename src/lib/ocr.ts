@@ -1,7 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { deduplicateText } from './dedup';
-import { structurePages } from './structure';
+import { structurePages, documentBodyHeight, HEADING_RATIO } from './structure';
 import { restoreSectionSigns } from './sectionSigns';
+import { createCorrector, type Corrector } from './ocrCorrect';
+import { cropFrame } from './cropFrames';
 
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
@@ -56,7 +58,16 @@ function cleanResponse(text: string): string {
     .trim();
 }
 
-export async function ocrImage(imagePath: string, _language: string): Promise<string> {
+const PAGE_PROMPT =
+  'Transcribe only the document text visible in this image. Do not describe the image. ' +
+  'Do not add any commentary. Do not use code blocks. Output only the raw text exactly as ' +
+  'it appears, preserving headings and paragraphs.';
+
+export async function ocrImage(
+  imagePath: string,
+  _language: string,
+  prompt: string = PAGE_PROMPT
+): Promise<string> {
   const base64 = await imageToBase64(imagePath);
 
   let response: Response;
@@ -66,7 +77,7 @@ export async function ocrImage(imagePath: string, _language: string): Promise<st
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OLLAMA_MODEL,
-        prompt: 'Transcribe only the document text visible in this image. Do not describe the image. Do not add any commentary. Do not use code blocks. Output only the raw text exactly as it appears, preserving headings and paragraphs.',
+        prompt,
         images: [base64],
         stream: false,
       }),
@@ -258,6 +269,101 @@ export interface HybridOcrResult {
   framesFailedEntirely: number;
 }
 
+let correctorPromise: Promise<Corrector | null> | null = null;
+
+/**
+ * The dictionary-backed OCR repair pass (`ocrCorrect.ts`).
+ *
+ * Loaded on first use rather than at startup: the word list is ~2.8 MB of
+ * text and only matters once a run begins. A failure to load degrades to
+ * unrepaired text, never to a failed run.
+ */
+function loadCorrector(): Promise<Corrector | null> {
+  correctorPromise ??= import('../../node_modules/word-list/words.txt?raw')
+    .then(m => createCorrector(m.default.split('\n')))
+    .catch(e => {
+      console.warn('[OCR] word list unavailable — skipping text repair:', e);
+      return null;
+    });
+  return correctorPromise;
+}
+
+const HEADING_PROMPT =
+  'Transcribe the text in this image exactly as written. ' +
+  'Output only that text, on one line, with no commentary.';
+
+/**
+ * Re-read heading lines that Windows OCR garbled, using the vision model on
+ * just that line.
+ *
+ * WHY HEADINGS: display type is where Windows OCR fails worst. On a real
+ * chapter opener, "Risk of Loss and / Warranties" came back as "Råsk of Loss
+ * and / WORntes" — at body size the same engine read 99%+ of words correctly.
+ * Headings are also few, so sending each suspect one to the slow model costs
+ * seconds per chapter rather than minutes per page.
+ *
+ * A line is suspect when it still holds a non-word after dictionary repair.
+ * The re-read is kept only if it is a plausible length for the same line, so
+ * a model that rambles or returns nothing leaves the original in place.
+ *
+ * Returns how many lines were replaced. Stops at the first backend error:
+ * if Ollama is down, every later call would fail the same way.
+ */
+async function rereadSuspectHeadings(
+  framePaths: string[],
+  framePages: OcrPageGeometry[],
+  framesText: string[],
+  corrector: Corrector
+): Promise<number> {
+  const bodyHeight = documentBodyHeight(framePages);
+  if (bodyHeight <= 0) return 0;
+
+  let replaced = 0;
+  for (let i = 0; i < framePages.length; i++) {
+    const page = framePages[i];
+    for (let j = 0; j < page.lines.length; j++) {
+      const line = page.lines[j];
+      if (line.height < bodyHeight * HEADING_RATIO || !corrector.hasUnknownWord(line.text)) continue;
+
+      // Padding keeps ascenders, descenders and the first/last glyph whole.
+      const padX = line.height * 0.5;
+      const padY = line.height * 0.3;
+      const region = {
+        x: line.left - padX,
+        y: line.top - padY,
+        width: line.width + padX * 2,
+        height: line.height + padY * 2,
+      };
+
+      let reread: string;
+      try {
+        const linePath = await cropFrame(
+          framePaths[i],
+          region,
+          framePaths[i].replace(/(\.png)?$/i, `_heading${j}.png`)
+        );
+        reread = (await ocrImage(linePath, '', HEADING_PROMPT)).split('\n')[0].trim();
+      } catch (e) {
+        console.warn(`[OCR] heading re-read failed for "${line.text}":`, e);
+        if (e instanceof OcrBackendError) return replaced;
+        continue;
+      }
+
+      const lengthRatio = reread.length / Math.max(1, line.text.length);
+      if (!reread || lengthRatio < 0.5 || lengthRatio > 2) {
+        console.log(`[OCR] heading re-read rejected: "${line.text}" -> "${reread}"`);
+        continue;
+      }
+
+      console.log(`[OCR] heading re-read: "${line.text}" -> "${reread}"`);
+      framesText[i] = framesText[i].replace(line.text, reread);
+      page.lines[j] = { ...line, text: reread };
+      replaced++;
+    }
+  }
+  return replaced;
+}
+
 /**
  * Run OCR on `framePaths` using the built-in Windows recogniser as the primary
  * engine.
@@ -300,6 +406,7 @@ export async function runHybridOcrPipeline(
   let firstRejection: string | null = null;
 
   console.log(`[OCR] frames to process: ${framePaths.length}`);
+  const corrector = await loadCorrector();
 
   for (let i = 0; i < framePaths.length; i++) {
     const label = `${i + 1}/${framePaths.length}`;
@@ -314,11 +421,12 @@ export async function runHybridOcrPipeline(
       });
       // Repaired here, before anything reads the text, so the plain transcript,
       // the structured one and the cleanup input all carry the same fix.
-      wResult = {
-        ...raw,
-        text: restoreSectionSigns(raw.text),
-        lines: raw.lines.map(line => ({ ...line, text: restoreSectionSigns(line.text) })),
-      };
+      // `text` is rebuilt from the lines, exactly as the Rust side builds it.
+      const lines = raw.lines.map(line => {
+        const text = restoreSectionSigns(line.text);
+        return { ...line, text: corrector ? corrector.correctLine(text) : text };
+      });
+      wResult = { ...raw, lines, text: lines.map(l => l.text).join('\n') };
     } catch (e) {
       console.warn(`[OCR] frame ${label}: windows OCR invocation error —`, e);
       if (!firstPrimaryError) firstPrimaryError = e instanceof Error ? e.message : String(e);
@@ -444,6 +552,11 @@ export async function runHybridOcrPipeline(
         : 'Fix the primary engine first; the fallback is only meant for frames ' +
           'Windows OCR reads poorly.')
     );
+  }
+
+  if (corrector) {
+    const replaced = await rereadSuspectHeadings(framePaths, framePages, framesText, corrector);
+    if (replaced > 0) console.log(`[OCR] ${replaced} heading line(s) re-read by ${OLLAMA_MODEL}`);
   }
 
   // Structure is recovered per frame and then deduplicated exactly as the

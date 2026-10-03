@@ -20,7 +20,8 @@
     "lucide-react": "^0.453.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tesseract.js": "^5.1.0"
+    "tesseract.js": "^5.1.0",
+    "word-list": "^4.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0-rc",

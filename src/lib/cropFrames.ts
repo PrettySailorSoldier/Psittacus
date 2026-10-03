@@ -93,13 +93,18 @@ function croppedPathFor(framePath: string): string {
 }
 
 /**
- * Crop a single frame to `region` and write the result next to the source as
- * `cropped_<name>.png`. Returns the path of the new file.
+ * Crop a single frame to `region` and write the result to `outPath` — by
+ * default next to the source as `cropped_<name>.png`. Returns the path of the
+ * new file.
  *
  * `region` is interpreted in the source image's native pixel coordinates and
  * is clamped to its bounds before use.
  */
-export async function cropFrame(framePath: string, region: CropRegion): Promise<string> {
+export async function cropFrame(
+  framePath: string,
+  region: CropRegion,
+  outPath: string = croppedPathFor(framePath)
+): Promise<string> {
   const img = await loadImage(await toDataUrl(framePath), framePath);
 
   const r = clampRegion(region, img.naturalWidth, img.naturalHeight);
@@ -118,7 +123,6 @@ export async function cropFrame(framePath: string, region: CropRegion): Promise<
   const blob = await canvasToBlob(canvas);
   const bytes = new Uint8Array(await blob.arrayBuffer());
 
-  const outPath = croppedPathFor(framePath);
   const { writeFile } = await import('@tauri-apps/plugin-fs');
   await writeFile(outPath, bytes);
 
