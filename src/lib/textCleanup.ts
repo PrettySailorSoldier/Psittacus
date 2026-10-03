@@ -74,13 +74,56 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /** Strip the wrapper text small models tend to add despite instructions. */
-function stripPreamble(text: string): string {
+export function stripPreamble(text: string): string {
   return text
     .replace(/```[\w]*\n?/g, '')
+    // The prompt's own """ delimiters, echoed back.
+    .replace(/^\s*"""\s*$/gm, '')
     .replace(/^(here is|here's)[^\n]*:?\n+/gi, '')
     .replace(/^(cleaned|corrected|the cleaned)[^\n]*text:?\n+/gi, '')
     .replace(/^sure[^\n]*\n+/gi, '')
+    // A trailing note in the model's own voice ("Note: I removed the repeated
+    // lines … If you want me to rejoin the lines, please let me know.").
+    .replace(/\n+\(?Note:[^\n]*\b(?:I|me|you)\b[\s\S]*$/i, '')
     .trim();
+}
+
+/**
+ * Longest acceptable output, as a multiple of the input's length.
+ *
+ * Cleanup removes duplicated passages and fixes characters; it should never
+ * make a chunk meaningfully longer. Output that grows is the model writing
+ * its own text — on a real run, an invented sentence repeated seven times.
+ */
+const MAX_GROWTH = 1.15;
+
+/** A sentence this many times in one chunk's output is a generation loop. */
+const MAX_SENTENCE_REPEATS = 3;
+
+/**
+ * Why a chunk's cleaned output should be discarded, or null if it passes.
+ *
+ * These checks catch runaway generation, not every invention: a model that
+ * quietly rewrites one clause ("passes once the goods are shipped" for
+ * "passes once Ishmael delivers the goods to a carrier") produces text of the
+ * right length with no repeats, and no check here can tell. That is why the
+ * raw extraction is always kept alongside the cleaned version.
+ */
+export function rejectReason(output: string, input: string): string | null {
+  if (output.length > input.length * MAX_GROWTH) {
+    return `output grew from ${input.length} to ${output.length} chars`;
+  }
+
+  const counts = new Map<string, number>();
+  for (const sentence of output.split(/(?<=[.!?])\s+/)) {
+    const key = sentence.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (key.split(' ').length < 6) continue;
+    const n = (counts.get(key) ?? 0) + 1;
+    if (n >= MAX_SENTENCE_REPEATS) return `sentence repeated ${n} times: "${key.slice(0, 60)}…"`;
+    counts.set(key, n);
+  }
+
+  return null;
 }
 
 /**
@@ -151,6 +194,10 @@ async function cleanupChunk(chunk: string, previousTail: string): Promise<string
           // that, and the overflow is silently truncated from the *start* — so
           // the model would clean text it can no longer see. Set it explicitly.
           num_ctx: 8192,
+          // Stop a generation loop instead of letting it run to the context
+          // limit. English OCR text runs ~4 chars per token, so chars/3 leaves
+          // a third of headroom over an output the same length as the input.
+          num_predict: Math.ceil(chunk.length / 3) + 64,
         },
       }),
     });
@@ -209,8 +256,14 @@ export async function cleanupExtractedText(
 
     try {
       const out = await cleanupChunk(chunks[i], previousTail);
-      cleaned.push(out.length > 0 ? out : chunks[i]);
-      console.log(`[Cleanup] chunk ${i + 1}/${chunks.length}: ${chunks[i].length} -> ${out.length} chars`);
+      const rejected = out.length > 0 ? rejectReason(out, chunks[i]) : 'empty output';
+      if (rejected) {
+        console.warn(`[Cleanup] chunk ${i + 1}/${chunks.length} rejected (${rejected}), keeping raw text`);
+        cleaned.push(chunks[i]);
+      } else {
+        cleaned.push(out);
+        console.log(`[Cleanup] chunk ${i + 1}/${chunks.length}: ${chunks[i].length} -> ${out.length} chars`);
+      }
     } catch (e) {
       failures++;
       if (!firstFailure) firstFailure = e instanceof Error ? e : new Error(String(e));

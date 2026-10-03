@@ -567,7 +567,7 @@ export async function runHybridOcrPipeline(
   // Frames the structure pass could not analyse (no geometry, i.e. answered by
   // the vision fallback) keep their plain text, so nothing is ever dropped from
   // the structured output that survives in the plain one.
-  const structuredFrames = structurePages(framePages).map(
+  const structuredFrames = structurePages(framePages, corrector?.isWord).map(
     (markdown, i) => (markdown.trim().length > 0 ? markdown : framesText[i])
   );
 

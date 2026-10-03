@@ -213,6 +213,31 @@ export interface StructureContext {
   bodyHeight: number;
   /** Normalised margin-line texts that recur across pages — running heads. */
   runningHeads: Set<string>;
+  /**
+   * Dictionary lookup, when one is available. Side text is only dropped when
+   * it fails this test; without it, nothing is dropped as side text.
+   */
+  isWord?: (word: string) => boolean;
+}
+
+/**
+ * Whether a short fragment reads as junk rather than language: fewer than
+ * half its tokens are words or numbers.
+ *
+ * Position alone was not enough. Text inside a picture ("uctEA", "*3days")
+ * sits beside the prose — but so do the "FACTS:" and "DECISION: McDANIEL,
+ * Justice" labels of a case excerpt, and on a real run those were deleted
+ * along with the junk.
+ */
+function looksLikeJunk(text: string, isWord: (word: string) => boolean): boolean {
+  const tokens = words(text)
+    .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(Boolean);
+  if (tokens.length === 0) return true;
+  const wordlike = tokens.filter(t =>
+    /^[\d.,()§-]+$/.test(t) || isWord(t) || isWord(t.replace(/['’]s$/, ''))
+  ).length;
+  return wordlike * 2 < tokens.length;
 }
 
 /**
@@ -414,7 +439,7 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
     return { ...line, role: 'body' };
   });
 
-  refineBodyLines(lines, bodyHeight);
+  refineBodyLines(lines, bodyHeight, context.isWord);
 
   return { lines, pageNumber };
 }
@@ -473,7 +498,11 @@ function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
  * subheadings because "1. Good title," inside a list also looks like an
  * outline marker.
  */
-function refineBodyLines(lines: ClassifiedLine[], bodyHeight: number): void {
+function refineBodyLines(
+  lines: ClassifiedLine[],
+  bodyHeight: number,
+  isWord: ((word: string) => boolean) | undefined
+): void {
   // ── Table of contents ──────────────────────────────────────────────────────
   // One line ending in "(p. 12)" is a cross-reference in prose; a contents
   // page has them line after line. The last page of a contents list can carry
@@ -488,6 +517,7 @@ function refineBodyLines(lines: ClassifiedLine[], bodyHeight: number): void {
 
   for (const line of lines) {
     if (line.role !== 'body' || words(line.text).length > SIDE_TEXT_MAX_WORDS) continue;
+    if (!isWord || !looksLikeJunk(line.text, isWord)) continue;
     const besideProse = lines.some(other => {
       if (other === line || !isProse(other)) return false;
       const overlapsVertically =
@@ -763,14 +793,20 @@ function formatListItem(text: string): string {
  * run the existing frame-level dedup over the result exactly as it does over
  * plain text. A page with no geometry yields `''`; the caller substitutes that
  * frame's plain OCR text.
+ *
+ * `isWord` enables dropping junk text beside the prose (see `looksLikeJunk`).
  */
-export function structurePages(pages: OcrPageGeometry[]): string[] {
+export function structurePages(
+  pages: OcrPageGeometry[],
+  isWord?: (word: string) => boolean
+): string[] {
   const bodyHeight = documentBodyHeight(pages);
   if (bodyHeight <= 0) return pages.map(() => '');
 
   const context: StructureContext = {
     bodyHeight,
     runningHeads: collectRunningHeads(pages, MARGIN_BAND),
+    isWord,
   };
 
   return pages.map(page => renderPageMarkdown(analysePage(page, context), bodyHeight));
