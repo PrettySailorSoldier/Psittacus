@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { deduplicateText } from './dedup';
 import { structurePages } from './structure';
+import { restoreSectionSigns } from './sectionSigns';
 
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
@@ -308,9 +309,16 @@ export async function runHybridOcrPipeline(
     // ── Step 1: Windows OCR ──────────────────────────────────────────────────
     let wResult: WindowsOcrCommandResult | null = null;
     try {
-      wResult = await invoke<WindowsOcrCommandResult>('windows_ocr_image', {
+      const raw = await invoke<WindowsOcrCommandResult>('windows_ocr_image', {
         path: framePaths[i],
       });
+      // Repaired here, before anything reads the text, so the plain transcript,
+      // the structured one and the cleanup input all carry the same fix.
+      wResult = {
+        ...raw,
+        text: restoreSectionSigns(raw.text),
+        lines: raw.lines.map(line => ({ ...line, text: restoreSectionSigns(line.text) })),
+      };
     } catch (e) {
       console.warn(`[OCR] frame ${label}: windows OCR invocation error —`, e);
       if (!firstPrimaryError) firstPrimaryError = e instanceof Error ? e.message : String(e);
@@ -365,7 +373,7 @@ export async function runHybridOcrPipeline(
       }
 
       try {
-        text = await ocrImage(framePaths[i], language);
+        text = restoreSectionSigns(await ocrImage(framePaths[i], language));
         // Left empty deliberately: the vision model reports no geometry, and
         // fabricating boxes would poison the structure pass downstream.
         page = { lines: [], imageWidth: 0, imageHeight: 0 };

@@ -24,8 +24,24 @@
 
 import type { OcrLineBox, OcrPageGeometry } from './ocr';
 
-/** What a line turned out to be. */
-export type LineRole = 'title' | 'heading' | 'body' | 'pageNumber' | 'runningHead';
+/**
+ * What a line turned out to be.
+ *
+ *   subheading — a numbered/lettered heading set at body size ("2. Buyer's Breach")
+ *   callout    — emphasised text set slightly larger than body (a boxed rule)
+ *   listItem   — one entry of a numbered, lettered or bulleted list
+ *   sideText   — stray words beside the prose, e.g. text inside a figure
+ */
+export type LineRole =
+  | 'title'
+  | 'heading'
+  | 'subheading'
+  | 'body'
+  | 'callout'
+  | 'listItem'
+  | 'pageNumber'
+  | 'runningHead'
+  | 'sideText';
 
 export interface ClassifiedLine extends OcrLineBox {
   role: LineRole;
@@ -83,6 +99,54 @@ const PARAGRAPH_GAP_RATIO = 0.6;
 const INDENT_RATIO = 0.8;
 
 const ROMAN_NUMERAL = /^m*(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$/i;
+
+/**
+ * Height ratio at which a body-width line counts as a callout.
+ *
+ * Measured on a law textbook: body lines 21px, the italic boxed rule
+ * statements 24px (1.14x), bold-italic subheadings 22px (1.05x). The threshold
+ * sits between the subheadings and the callouts, and below HEADING_RATIO.
+ *
+ * A callout's last line can measure at body height when it happens to have no
+ * descenders ("Code § 1790.3]." came back at 21px), so the renderer keeps a
+ * callout paragraph going across such a line rather than relying on this
+ * ratio for every line.
+ */
+const CALLOUT_RATIO = 1.1;
+
+/**
+ * Outline markers that open a subheading: "II.", "A.", "3.".
+ *
+ * Needed because size alone misses them. In the measured textbook, numbered
+ * subheadings are set bold-italic at body size (22px against 21px), so no
+ * height threshold separates them from prose without also catching callouts.
+ */
+const OUTLINE_MARKER = /^(?:[IVXLC]+|[A-Z]|\d{1,2})\.\s+\S/;
+
+/** Longest line, in words, still treated as a subheading. */
+const SUBHEADING_MAX_WORDS = 12;
+
+/** Widest a subheading may be, as a fraction of the page's widest body line. */
+const SUBHEADING_MAX_WIDTH = 0.75;
+
+/** List markers: "1." "1)" "a." "a)" and common bullet glyphs. */
+const LIST_MARKER = /^(\d{1,2}[.)]|[A-Za-z][.)]|[•●▪◦·*–-])\s+\S/;
+
+/**
+ * Side text: at most this many words, sitting beside (not within) a line of
+ * prose, separated from it by at least `SIDE_TEXT_MIN_GAP_RATIO` body heights.
+ *
+ * This is what text wrapped around a picture looks like when the picture
+ * itself contains words. Measured: a word-cloud image beside a wrapped
+ * paragraph yielded "uctEA", "customari" and "*3days", each level with a prose
+ * line ending 230px to their left.
+ *
+ * Kept to short fragments next to real prose so a second text column (long
+ * lines) is never mistaken for it.
+ */
+const SIDE_TEXT_MAX_WORDS = 3;
+const SIDE_TEXT_NEIGHBOUR_MIN_WORDS = 6;
+const SIDE_TEXT_MIN_GAP_RATIO = 2;
 
 function words(text: string): string[] {
   return text.trim().split(/\s+/).filter(Boolean);
@@ -296,7 +360,121 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
     return { ...line, role: 'body' };
   });
 
+  refineBodyLines(lines, bodyHeight);
+
   return { lines, pageNumber };
+}
+
+/** Vertical gap between the bottom of `above` and the top of `below`. */
+function gapBetween(above: OcrLineBox, below: OcrLineBox): number {
+  return below.top - (above.top + above.height);
+}
+
+/** Position of a list marker in its sequence (1, 2, 3 / a, b, c), or null for bullets. */
+function markerOrdinal(text: string): number | null {
+  const marker = text.trim().split(/\s+/)[0].replace(/[.)]$/, '');
+  if (/^\d+$/.test(marker)) return parseInt(marker, 10);
+  if (/^[a-z]$/i.test(marker)) return marker.toLowerCase().charCodeAt(0) - 96;
+  return null;
+}
+
+/**
+ * Mark the list items in one run of adjacent body lines.
+ *
+ * Requires two or more marker lines sharing a left edge and, for numbered or
+ * lettered markers, counting up by one. Prose wrapping so that two lines both
+ * happen to start with "2)" and "3)" is possible; prose doing that in sequence
+ * at the same indent is not something real paragraphs do.
+ */
+function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
+  const markers = run.filter(l => LIST_MARKER.test(l.text.trim()));
+  if (markers.length < 2) return;
+
+  const aligned = markers.every(l => Math.abs(l.left - markers[0].left) <= bodyHeight * 0.5);
+  if (!aligned) return;
+
+  const ordinals = markers.map(l => markerOrdinal(l.text));
+  const allBullets = ordinals.every(o => o === null);
+  const sequential = ordinals.every((o, i) => o !== null && (i === 0 || o === ordinals[i - 1]! + 1));
+  if (!allBullets && !sequential) return;
+
+  for (const line of markers) line.role = 'listItem';
+}
+
+/**
+ * Second pass over a classified page: the distinctions that need a line's
+ * neighbours, not just its own measurements.
+ *
+ * Order matters. Side text goes first so a figure fragment cannot split a
+ * list run or count as the line before a subheading; lists go before
+ * subheadings because "1. Good title," inside a list also looks like an
+ * outline marker.
+ */
+function refineBodyLines(lines: ClassifiedLine[], bodyHeight: number): void {
+  // ── Side text ──────────────────────────────────────────────────────────────
+  const isProse = (l: ClassifiedLine) =>
+    l.role === 'body' && words(l.text).length >= SIDE_TEXT_NEIGHBOUR_MIN_WORDS;
+
+  for (const line of lines) {
+    if (line.role !== 'body' || words(line.text).length > SIDE_TEXT_MAX_WORDS) continue;
+    const besideProse = lines.some(other => {
+      if (other === line || !isProse(other)) return false;
+      const overlapsVertically =
+        line.top < other.top + other.height && other.top < line.top + line.height;
+      const horizontalGap = Math.max(
+        line.left - (other.left + other.width),
+        other.left - (line.left + line.width)
+      );
+      return overlapsVertically && horizontalGap >= bodyHeight * SIDE_TEXT_MIN_GAP_RATIO;
+    });
+    if (besideProse) line.role = 'sideText';
+  }
+
+  // Lines in reading order that actually render.
+  const flow = lines.filter(
+    l => l.role !== 'pageNumber' && l.role !== 'runningHead' && l.role !== 'sideText'
+  );
+  const paragraphGap = bodyHeight * PARAGRAPH_GAP_RATIO;
+
+  // ── Lists ──────────────────────────────────────────────────────────────────
+  let runStart = 0;
+  for (let i = 1; i <= flow.length; i++) {
+    const runEnds =
+      i === flow.length ||
+      flow[i].role !== 'body' ||
+      flow[i - 1].role !== 'body' ||
+      gapBetween(flow[i - 1], flow[i]) > paragraphGap;
+    if (!runEnds) continue;
+    markListItems(flow.slice(runStart, i), bodyHeight);
+    runStart = i;
+  }
+
+  // ── Subheadings ────────────────────────────────────────────────────────────
+  const widestBody = Math.max(0, ...flow.filter(l => l.role === 'body').map(l => l.width));
+
+  flow.forEach((line, i) => {
+    if (line.role !== 'body') return;
+    const text = line.text.trim();
+    if (!OUTLINE_MARKER.test(text)) return;
+    if (words(text).length > SUBHEADING_MAX_WORDS) return;
+    // A heading does not end mid-sentence; a list entry or prose line does.
+    if (/[.,;:]$/.test(text)) return;
+    if (line.width > widestBody * SUBHEADING_MAX_WIDTH) return;
+
+    const previous = flow[i - 1];
+    const setApart =
+      previous === undefined ||
+      previous.role === 'title' ||
+      previous.role === 'heading' ||
+      previous.role === 'subheading' ||
+      gapBetween(previous, line) > paragraphGap;
+    if (setApart) line.role = 'subheading';
+  });
+
+  // ── Callouts ───────────────────────────────────────────────────────────────
+  for (const line of flow) {
+    if (line.role === 'body' && line.height / bodyHeight >= CALLOUT_RATIO) line.role = 'callout';
+  }
 }
 
 /**
@@ -332,40 +510,112 @@ function joinBodyLines(lineTexts: string[]): string {
 export function renderPageMarkdown(structure: PageStructure, bodyHeight: number): string {
   const blocks: string[] = [];
   let paragraph: string[] = [];
+  let paragraphKind: 'body' | 'callout' = 'body';
+  // Each entry is one list item's lines, so a wrapped item can be rejoined.
+  let listItems: string[][] = [];
+  let itemLeft = 0;
   let previous: ClassifiedLine | null = null;
 
-  const flush = () => {
+  const flushParagraph = () => {
     if (paragraph.length > 0) {
-      blocks.push(joinBodyLines(paragraph));
+      const text = joinBodyLines(paragraph);
+      blocks.push(paragraphKind === 'callout' ? `> ${text}` : text);
       paragraph = [];
     }
   };
 
-  for (const line of structure.lines) {
-    if (line.role === 'pageNumber' || line.role === 'runningHead') continue;
+  // Items joined by single newlines so Markdown renders one list, not several.
+  const flushList = () => {
+    if (listItems.length > 0) {
+      blocks.push(listItems.map(item => formatListItem(joinBodyLines(item))).join('\n'));
+      listItems = [];
+    }
+  };
 
-    if (line.role === 'title' || line.role === 'heading') {
-      flush();
-      blocks.push(`${line.role === 'title' ? '#' : '##'} ${line.text}`);
+  for (const line of structure.lines) {
+    if (line.role === 'pageNumber' || line.role === 'runningHead' || line.role === 'sideText') continue;
+    const text = line.text.trim();
+
+    if (line.role === 'title' || line.role === 'heading' || line.role === 'subheading') {
+      flushParagraph();
+      flushList();
+      blocks.push(`${headingPrefix(line)} ${text}`);
       previous = line;
       continue;
     }
 
-    // Body. Decide whether this continues the current paragraph or starts one.
-    if (previous !== null && previous.role === 'body') {
-      const gap = line.top - (previous.top + previous.height);
-      const indented = line.left > previous.left + bodyHeight * INDENT_RATIO;
-      if (gap > bodyHeight * PARAGRAPH_GAP_RATIO || indented) flush();
-    } else {
-      flush();
+    const adjacent =
+      previous !== null && line.top - (previous.top + previous.height) <= bodyHeight * PARAGRAPH_GAP_RATIO;
+
+    if (line.role === 'listItem') {
+      flushParagraph();
+      listItems.push([text]);
+      itemLeft = line.left;
+      previous = line;
+      continue;
     }
 
-    paragraph.push(line.text.trim());
+    // A wrapped list item continues under its text, to the right of the marker.
+    if (listItems.length > 0 && line.role === 'body' && adjacent &&
+        line.left > itemLeft + bodyHeight * 0.5) {
+      listItems[listItems.length - 1].push(text);
+      previous = line;
+      continue;
+    }
+    flushList();
+
+    // Body or callout: continue the current paragraph, or start a new one.
+    // Prose running straight into a callout is a break even without a gap —
+    // in the measured textbook the rule statement sat 11px under the prose,
+    // inside the normal paragraph spacing. The reverse is NOT a break on its
+    // own, because a callout's final line can measure at body height.
+    const indented = previous !== null && line.left > previous.left + bodyHeight * INDENT_RATIO;
+    const entersCallout = line.role === 'callout' && paragraphKind !== 'callout';
+    const continues = paragraph.length > 0 && adjacent && !indented && !entersCallout;
+
+    if (!continues) {
+      flushParagraph();
+      paragraphKind = line.role === 'callout' ? 'callout' : 'body';
+    }
+
+    paragraph.push(text);
     previous = line;
   }
 
-  flush();
+  flushParagraph();
+  flushList();
   return blocks.join('\n\n');
+}
+
+/**
+ * Markdown heading level for a heading line.
+ *
+ * Size-detected lines keep the levels they always had. Subheadings take their
+ * level from the outline marker, following the usual textbook hierarchy:
+ * "II." above "A." above "1.".
+ */
+function headingPrefix(line: ClassifiedLine): string {
+  if (line.role === 'title') return '#';
+  if (line.role === 'heading') return '##';
+  const marker = line.text.trim().split(/\s+/)[0];
+  if (/^[IVXLC]{2,}\.$/.test(marker)) return '##';
+  if (/^[A-Z]\.$/.test(marker)) return '###';
+  return '####';
+}
+
+/**
+ * Render one list item as Markdown.
+ *
+ * Numbered markers ("1." "1)") are already Markdown list syntax. Bullet glyphs
+ * become "-". Lettered markers have no Markdown equivalent, so they are kept
+ * as text inside a bullet — otherwise consecutive "a. …" / "b. …" lines would
+ * collapse into a single paragraph.
+ */
+function formatListItem(text: string): string {
+  if (/^\d{1,2}[.)]\s/.test(text)) return text;
+  const bullet = text.match(/^[•●▪◦·*–-]\s+(.*)$/);
+  if (bullet) return `- ${bullet[1]}`;
+  return `- ${text}`;
 }
 
 /**
