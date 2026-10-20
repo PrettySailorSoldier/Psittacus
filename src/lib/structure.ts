@@ -20,6 +20,11 @@
  * a title rather than as the page's own idea of "normal size". That trade is
  * correct for a screen recording of a reader at a fixed zoom, and wrong if the
  * zoom level changes mid-recording.
+ *
+ * List nesting levels are likewise taken from where list items sit across the
+ * whole document, so a frame that scrolled past a list's parent item still
+ * indents its nested items. That assumes the page does not shift sideways
+ * between frames, which a fixed crop of a scrolling reader guarantees.
  */
 
 import type { OcrLineBox, OcrPageGeometry } from './ocr';
@@ -32,6 +37,8 @@ import type { OcrLineBox, OcrPageGeometry } from './ocr';
  *   listItem   — one entry of a numbered, lettered or bulleted list
  *   sideText   — stray words beside the prose, e.g. text inside a figure
  *   tocEntry   — a table-of-contents line ending in a page reference
+ *   tableRow   — one row of cells sitting side by side (see `arrangeLines`)
+ *   clipped    — a line cut off by the frame edge and read as garbage
  */
 export type LineRole =
   | 'title'
@@ -41,12 +48,27 @@ export type LineRole =
   | 'callout'
   | 'listItem'
   | 'tocEntry'
+  | 'tableRow'
   | 'pageNumber'
   | 'runningHead'
-  | 'sideText';
+  | 'sideText'
+  | 'clipped';
 
-export interface ClassifiedLine extends OcrLineBox {
+/** A line in reading order. Table rows carry their cells, left to right. */
+export interface ArrangedLine extends OcrLineBox {
+  cells?: string[];
+  /**
+   * The line's list marker sat apart from its text, in a column of its own.
+   * That is how list markup is typeset; a sentence that happens to open with
+   * "7." is not set that way, so such a line is a list item even alone.
+   */
+  hangingMarker?: boolean;
+}
+
+export interface ClassifiedLine extends ArrangedLine {
   role: LineRole;
+  /** Type size relative to body text; see `lineSize`. */
+  size: number;
 }
 
 export interface PageStructure {
@@ -89,13 +111,26 @@ const CENTRE_TOLERANCE = 0.06;
 
 /**
  * A new paragraph starts when the vertical gap exceeds this multiple of body
- * height.
+ * height — the floor of the threshold, see `PARAGRAPH_GAP_MARGIN`.
  *
  * Measured: consecutive lines within a paragraph were separated by 3–4px
  * against a 22px body height (0.15x), while the gap across a paragraph break
  * was 51px (2.3x). Anything in between is comfortably separated.
  */
 const PARAGRAPH_GAP_RATIO = 0.6;
+
+/**
+ * How far past the document's ordinary line gap, in body heights, a gap must
+ * reach to count as a paragraph break.
+ *
+ * NEEDED BECAUSE LEADING VARIES. The ratio above was set on a tightly-leaded
+ * book. A web page set at 1.6 line height measured 17px between lines of 25px
+ * text (0.68x) — over that ratio — so every line came out as a paragraph of
+ * its own. The paragraph breaks on the same page were 36px. Measuring the
+ * ordinary line gap per document and adding this margin separates both
+ * layouts: the book's threshold stays where it was.
+ */
+const PARAGRAPH_GAP_MARGIN = 0.4;
 
 /** Indent, in multiples of body height, that marks a first line even without a gap. */
 const INDENT_RATIO = 0.8;
@@ -161,6 +196,58 @@ const SIDE_TEXT_MAX_WORDS = 3;
 const SIDE_TEXT_NEIGHBOUR_MIN_WORDS = 6;
 const SIDE_TEXT_MIN_GAP_RATIO = 2;
 
+/**
+ * A list marker standing alone on its line.
+ *
+ * Windows OCR returns a hanging list marker as a separate line, and returns
+ * the whole column of them before the text they belong to. Measured on a web
+ * page: "1." … "7." came back as seven lines, then the seven items.
+ */
+const MARKER_ONLY = /^(?:\d{1,2}|[A-Za-z]|[IVXLC]{1,4})[.)]$|^[•●▪◦·*–-]$/;
+
+/** Furthest a lone marker may sit from its text, in body heights. */
+const MARKER_MAX_GAP_RATIO = 3;
+
+/**
+ * Pairs of long side-by-side lines that mark a page as multi-column. Below
+ * this the page is read row by row; at or above it the engine's own order,
+ * which already walks one column at a time, is kept.
+ */
+const MULTI_COLUMN_MIN_PAIRS = 3;
+
+/** Longest cell, in words, a table row may hold — longer is a column of prose. */
+const TABLE_CELL_MAX_WORDS = 8;
+
+/** A table needs one column of short cells (labels, figures) at least this short. */
+const TABLE_SHORT_CELL_WORDS = 3;
+
+/**
+ * Longest line, in words, that can be promoted to a heading for standing
+ * apart from its neighbours (see the heading pass in `refineBodyLines`).
+ */
+const STANDALONE_HEADING_MAX_WORDS = 10;
+
+/**
+ * Smallest size a centred line may have and still be a chapter label. Keeps
+ * the small print inside a picture (a report title in a screenshot) out.
+ */
+const CENTRED_HEADING_MIN_SIZE = 0.9;
+
+/**
+ * A line counts as touching the frame edge within this many body heights.
+ *
+ * A line the frame cuts through comes back as the part the engine could see,
+ * and its box runs to the edge. On a real run these read "your ume unu
+ * cureJuuy your cnutces." and "tranqartinn« for theqe rprpint«".
+ */
+const EDGE_TOLERANCE_RATIO = 0.15;
+
+/** Share of tokens that must be words for an edge line to be kept. */
+const CLIPPED_MIN_WORD_SHARE = 0.75;
+
+/** Fewest body words of a letter shape needed to trust its median height. */
+const MIN_SHAPE_SAMPLES = 8;
+
 function words(text: string): string[] {
   return text.trim().split(/\s+/).filter(Boolean);
 }
@@ -207,10 +294,23 @@ function folioCandidate(text: string): string | null {
 }
 
 /**
+ * Document-wide measurements every page is judged against.
+ */
+export interface DocumentMetrics {
+  /** Median line height of body text, weighted by words. */
+  bodyHeight: number;
+  /** Median height of words of each letter shape; see `shapeClass`. */
+  shapeHeights: Map<string, number>;
+  /** Ordinary vertical gap between lines of one paragraph. */
+  lineGap: number;
+  /** Vertical gap above which consecutive lines belong to separate paragraphs. */
+  paragraphGap: number;
+}
+
+/**
  * Document-wide facts a single page cannot establish on its own.
  */
-export interface StructureContext {
-  bodyHeight: number;
+export interface StructureContext extends DocumentMetrics {
   /** Normalised margin-line texts that recur across pages — running heads. */
   runningHeads: Set<string>;
   /**
@@ -230,14 +330,19 @@ export interface StructureContext {
  * along with the junk.
  */
 function looksLikeJunk(text: string, isWord: (word: string) => boolean): boolean {
+  return wordShare(text, isWord) < 0.5;
+}
+
+/** Share of a line's tokens that are words or numbers; 0 for a line with none. */
+function wordShare(text: string, isWord: (word: string) => boolean): number {
   const tokens = words(text)
     .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
     .filter(Boolean);
-  if (tokens.length === 0) return true;
+  if (tokens.length === 0) return 0;
   const wordlike = tokens.filter(t =>
     /^[\d.,()§-]+$/.test(t) || isWord(t) || isWord(t.replace(/['’]s$/, ''))
   ).length;
-  return wordlike * 2 < tokens.length;
+  return wordlike / tokens.length;
 }
 
 /**
@@ -347,13 +452,272 @@ export function documentBodyHeight(pages: OcrPageGeometry[]): number {
 }
 
 /**
+ * Which letter shapes a word contains, as a key: how high it reaches
+ * (`T` capitals, digits and full ascenders; `i` the dot of an i; `t` the
+ * short stem of a t; `x` x-height only), plus `d` if it reaches below the
+ * baseline.
+ *
+ * WHY: a word's box is tight to its glyphs, so its height says as much about
+ * its letters as about its type size. Measured on one line of 26px body text:
+ * "on" 13px, "to" 16px, "the" 20px, "for" 25px. Comparing each word against
+ * body words of the same shape takes the letters out of the measurement.
+ */
+function shapeClass(word: string): string {
+  const reach = /[A-Z0-9bdfhkl$&#%@?!/\\|()[\]{}]/.test(word)
+    ? 'T'
+    : /i/.test(word) ? 'i' : /t/.test(word) ? 't' : 'x';
+  return /[gjpqy,;$@|()[\]{}]/.test(word) ? `${reach}d` : reach;
+}
+
+/**
+ * Size of a line's type relative to body text: 1 for body, ~1.5 for a section
+ * heading.
+ *
+ * The median, over the line's words, of each word's height against body words
+ * of the same shape. Two failures of the line's union box this avoids, both
+ * measured on a real page: a heading with no descenders ("Add and Edit
+ * Vendors") came back shorter than body lines that had them, and a sentence
+ * with one bold word in a taller face cleared the callout threshold.
+ *
+ * Falls back to the line box when the line carries no word geometry.
+ */
+export function lineSize(line: OcrLineBox, metrics: DocumentMetrics): number {
+  const ratios: number[] = [];
+  for (const word of line.words ?? []) {
+    const reference = metrics.shapeHeights.get(shapeClass(word.text));
+    if (reference && word.height > 0) ratios.push(word.height / reference);
+  }
+  if (ratios.length > 0) return median(ratios);
+  return metrics.bodyHeight > 0 ? line.height / metrics.bodyHeight : 1;
+}
+
+/**
+ * Measure the document: body height, the height of each letter shape, and
+ * the gap that separates paragraphs.
+ *
+ * Gaps are sampled between vertically consecutive body-sized lines that
+ * overlap horizontally, so a neighbouring column or a margin note does not
+ * count as "the next line". Most such pairs are lines of one paragraph, so the
+ * median is the ordinary line gap.
+ */
+export function documentMetrics(pages: OcrPageGeometry[]): DocumentMetrics {
+  const bodyHeight = documentBodyHeight(pages);
+
+  const byShape = new Map<string, number[]>();
+  for (const page of pages) {
+    for (const line of page.lines) {
+      for (const word of line.words ?? []) {
+        if (word.height <= 0) continue;
+        const key = shapeClass(word.text);
+        const list = byShape.get(key) ?? [];
+        list.push(word.height);
+        byShape.set(key, list);
+      }
+    }
+  }
+  const shapeHeights = new Map<string, number>();
+  for (const [key, heights] of byShape) {
+    if (heights.length >= MIN_SHAPE_SAMPLES) shapeHeights.set(key, median(heights));
+  }
+
+  const gaps: number[] = [];
+  for (const page of pages) {
+    const lines = page.lines
+      .filter(l =>
+        words(l.text).length >= 3 &&
+        l.height >= bodyHeight * 0.7 &&
+        l.height <= bodyHeight * 1.4
+      )
+      .sort((a, b) => a.top - b.top);
+    for (let i = 1; i < lines.length; i++) {
+      const above = lines[i - 1];
+      const below = lines[i];
+      const overlaps =
+        below.left < above.left + above.width && above.left < below.left + below.width;
+      const gap = gapBetween(above, below);
+      if (overlaps && gap > -bodyHeight * 0.5 && gap < bodyHeight * 3) gaps.push(gap);
+    }
+  }
+  const lineGap = gaps.length > 0 ? median(gaps) : 0;
+  const paragraphGap = Math.max(
+    bodyHeight * PARAGRAPH_GAP_RATIO,
+    gaps.length > 0 ? lineGap + bodyHeight * PARAGRAPH_GAP_MARGIN : 0
+  );
+
+  return { bodyHeight, shapeHeights, lineGap, paragraphGap };
+}
+
+/** Whether two lines sit on the same row: their vertical centres nearly agree. */
+function sameRow(a: OcrLineBox, b: OcrLineBox): boolean {
+  const centreA = a.top + a.height / 2;
+  const centreB = b.top + b.height / 2;
+  return Math.abs(centreA - centreB) <= Math.min(a.height, b.height) * 0.5;
+}
+
+/** The union of two lines' boxes, carrying both lines' words. */
+function unionBox(a: OcrLineBox, b: OcrLineBox, text: string): OcrLineBox {
+  const left = Math.min(a.left, b.left);
+  const top = Math.min(a.top, b.top);
+  const right = Math.max(a.left + a.width, b.left + b.width);
+  const bottom = Math.max(a.top + a.height, b.top + b.height);
+  return {
+    text,
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
+    words: [...(a.words ?? []), ...(b.words ?? [])],
+  };
+}
+
+/**
+ * Re-attach each lone list marker to the line it numbers.
+ *
+ * The marker is joined to the nearest line on its row to its right. One with
+ * no such line (a marker whose text the engine missed) is left as it is.
+ */
+function attachMarkers(lines: OcrLineBox[], bodyHeight: number): ArrangedLine[] {
+  const out: ArrangedLine[] = [...lines];
+  for (const marker of lines) {
+    if (!MARKER_ONLY.test(marker.text.trim())) continue;
+    const markerRight = marker.left + marker.width;
+
+    let target = -1;
+    out.forEach((line, i) => {
+      if (line === marker || MARKER_ONLY.test(line.text.trim())) return;
+      const gap = line.left - markerRight;
+      if (gap < -marker.width * 0.5 || gap > bodyHeight * MARKER_MAX_GAP_RATIO) return;
+      if (!sameRow(marker, line)) return;
+      if (target === -1 || line.left < out[target].left) target = i;
+    });
+    if (target === -1) continue;
+
+    out[target] = {
+      ...unionBox(marker, out[target], `${marker.text.trim()} ${out[target].text.trim()}`),
+      hangingMarker: true,
+    };
+    out.splice(out.indexOf(marker), 1);
+  }
+  return out;
+}
+
+/** Group lines into rows, top to bottom, each row's lines left to right. */
+function groupRows<T extends OcrLineBox>(lines: T[]): T[][] {
+  const sorted = [...lines].sort((a, b) => (a.top + a.height / 2) - (b.top + b.height / 2));
+  const rows: T[][] = [];
+  for (const line of sorted) {
+    const row = rows[rows.length - 1];
+    if (row && sameRow(row[0], line)) row.push(line);
+    else rows.push([line]);
+  }
+  for (const row of rows) row.sort((a, b) => a.left - b.left);
+  return rows;
+}
+
+/**
+ * Whether the page is set in several columns of prose: long lines sitting
+ * side by side on the same row, again and again.
+ */
+function isMultiColumn(rows: OcrLineBox[][]): boolean {
+  const pairs = rows.filter(row => row.filter(l => words(l.text).length >= 6).length >= 2).length;
+  return pairs >= MULTI_COLUMN_MIN_PAIRS;
+}
+
+/** Whether `row` can continue a table whose previous row is `previous`. */
+function continuesTable(previous: OcrLineBox[], row: OcrLineBox[]): boolean {
+  if (row.length !== previous.length) return false;
+  // Each cell overlaps the cell above it horizontally. Overlap rather than a
+  // shared edge, because a column of figures is right-aligned and a "TOTAL"
+  // label may be outdented from the labels above it.
+  return row.every((cell, i) => {
+    const above = previous[i];
+    return cell.left < above.left + above.width && above.left < cell.left + cell.width;
+  });
+}
+
+const DECIMAL_FIGURE = /^\(?[$€£]?-?[\d,]+\.\d{2}\)?$/;
+
+/**
+ * Restore decimal points the engine dropped from a column of money.
+ *
+ * Measured on a report screenshot: "250.00" read as "25000" and "16.84" as
+ * "16 84", in a column whose other cells read "48.96" and "$315.80". Enlarging
+ * the image before re-reading did not bring the points back. A cell is only
+ * repaired when at least two others in its column show the two-decimal format.
+ */
+function repairFigureColumns(rows: string[][]): void {
+  const columns = rows[0]?.length ?? 0;
+  for (let c = 0; c < columns; c++) {
+    const formatted = rows.filter(row => DECIMAL_FIGURE.test(row[c])).length;
+    if (formatted < 2) continue;
+    for (const row of rows) {
+      row[c] = row[c].replace(/^([$€£]?\d+) ?(\d{2})$/, '$1.$2');
+    }
+  }
+}
+
+/**
+ * Put a page's lines into reading order, re-attach list markers, and gather
+ * tables into rows.
+ *
+ * WHY: Windows OCR returns lines block by block, not row by row. A column of
+ * list markers, or the figures column of a table, comes back as one block
+ * after the text beside it. On a real page "1." … "7." were all returned
+ * before the first item, and a two-column table came back as every label and
+ * then every amount.
+ *
+ * A single-column page is re-read row by row. A page of several prose columns
+ * keeps the engine's order, which walks each column in turn; reading it row by
+ * row would interleave them.
+ */
+export function arrangeLines(lines: OcrLineBox[], bodyHeight: number): ArrangedLine[] {
+  const attached = attachMarkers(lines, bodyHeight);
+  const rows = groupRows(attached);
+  if (isMultiColumn(rows)) return attached;
+
+  const out: ArrangedLine[] = [];
+  let i = 0;
+  while (i < rows.length) {
+    // The longest run of rows, from here, that reads as a table.
+    let end = i;
+    while (
+      end < rows.length &&
+      rows[end].length >= 2 &&
+      rows[end].every(cell => words(cell.text).length <= TABLE_CELL_MAX_WORDS) &&
+      (end === i || continuesTable(rows[end - 1], rows[end]))
+    ) {
+      end++;
+    }
+
+    const run = rows.slice(i, end);
+    const hasShortColumn =
+      run.length > 0 &&
+      run[0].some((_, c) => run.every(row => words(row[c].text).length <= TABLE_SHORT_CELL_WORDS));
+
+    if (run.length >= 2 && hasShortColumn) {
+      const cells = run.map(row => row.map(cell => cell.text.trim()));
+      repairFigureColumns(cells);
+      run.forEach((row, r) => {
+        const box = row.reduce((acc, cell) => unionBox(acc, cell, ''));
+        out.push({ ...box, text: cells[r].join(' | '), cells: cells[r] });
+      });
+      i = end;
+    } else {
+      out.push(...rows[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+/**
  * Classify every line on one page.
  *
  * `bodyHeight` comes from `documentBodyHeight` so the answer does not depend
  * on what happens to be on this particular page.
  */
 export function analysePage(page: OcrPageGeometry, context: StructureContext): PageStructure {
-  const { bodyHeight, runningHeads } = context;
+  const { bodyHeight, runningHeads, isWord } = context;
   if (page.lines.length === 0 || bodyHeight <= 0) {
     return { lines: [], pageNumber: null };
   }
@@ -361,26 +725,42 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
   const pageCentre = page.imageWidth / 2;
   const topBand = page.imageHeight * MARGIN_BAND;
   const bottomBand = page.imageHeight * (1 - MARGIN_BAND);
+  const edgeTolerance = Math.max(2, bodyHeight * EDGE_TOLERANCE_RATIO);
+  const arranged = arrangeLines(page.lines, bodyHeight);
 
   // Where the text block starts. Taken from body-sized lines only, so a
   // centred title cannot drag the margin leftward.
-  const bodyLefts = page.lines
-    .filter(l => l.height <= bodyHeight * HEADING_RATIO)
+  const bodyLefts = arranged
+    .filter(l => lineSize(l, context) < HEADING_RATIO)
     .map(l => l.left);
-  const bodyLeft = bodyLefts.length > 0 ? median(bodyLefts) : median(page.lines.map(l => l.left));
+  const bodyLeft = bodyLefts.length > 0 ? median(bodyLefts) : median(arranged.map(l => l.left));
 
   let pageNumber: string | null = null;
-  const edges = edgeLines(page.lines);
+  const edges = edgeLines(arranged);
 
-  const lines: ClassifiedLine[] = page.lines.map(line => {
+  const lines: ClassifiedLine[] = arranged.map(line => {
     const lineWords = words(line.text);
     const inMargin = line.top < topBand || line.top + line.height > bottomBand;
     const atEdge = edges.has(line);
-    const ratio = line.height / bodyHeight;
+    const ratio = lineSize(line, context);
     const centre = line.left + line.width / 2;
     const isCentred =
       Math.abs(centre - pageCentre) < page.imageWidth * CENTRE_TOLERANCE &&
       line.width < page.imageWidth * 0.75;
+    const classify = (role: LineRole): ClassifiedLine => ({ ...line, role, size: ratio });
+
+    if (line.cells) return classify('tableRow');
+
+    // ── Cut by the frame edge ────────────────────────────────────────────────
+    // Only dropped when it also reads as garbage: a cut line the engine still
+    // read correctly costs nothing to keep. A dropped one is not lost — the
+    // next or previous frame of a scroll shows it whole, and stitching takes
+    // it from there.
+    const touchesEdge =
+      line.top <= edgeTolerance || line.top + line.height >= page.imageHeight - edgeTolerance;
+    if (touchesEdge && isWord && wordShare(line.text, isWord) < CLIPPED_MIN_WORD_SHARE) {
+      return classify('clipped');
+    }
 
     // ── Page furniture ───────────────────────────────────────────────────────
     // Sitting in the margin band is necessary but NOT sufficient: a chapter
@@ -392,7 +772,7 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
       const wholeLine = folioCandidate(line.text);
       if (wholeLine !== null) {
         pageNumber ??= wholeLine;
-        return { ...line, role: 'pageNumber' };
+        return classify('pageNumber');
       }
 
       // Running heads commonly carry the folio at one end: "142  THE SILENT
@@ -405,18 +785,18 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
         : null;
       if (edgeFolio !== null) {
         pageNumber ??= edgeFolio;
-        return { ...line, role: 'runningHead' };
+        return classify('runningHead');
       }
 
       if (runningHeads.has(normaliseMarginLine(line.text))) {
-        return { ...line, role: 'runningHead' };
+        return classify('runningHead');
       }
     }
 
     // ── Table of contents ────────────────────────────────────────────────────
     // Ahead of the size tests: an outline entry set in capitals ("VI. TERMS
     // (p. 461)") measures as a heading, and was rendered as one.
-    if (TOC_ENTRY.test(line.text)) return { ...line, role: 'tocEntry' };
+    if (TOC_ENTRY.test(line.text)) return classify('tocEntry');
 
     // ── Headings, by measurement ─────────────────────────────────────────────
     // A heading never starts in lowercase. Without this guard a paragraph's
@@ -424,22 +804,27 @@ export function analysePage(page: OcrPageGeometry, context: StructureContext): P
     // heading on a real run.
     const startsLowercase = /^[a-z]/.test(line.text.trim());
     if (!startsLowercase) {
-      if (ratio >= TITLE_RATIO) return { ...line, role: 'title' };
-      if (ratio >= HEADING_RATIO) return { ...line, role: 'heading' };
+      if (ratio >= TITLE_RATIO) return classify('title');
+      if (ratio >= HEADING_RATIO) return classify('heading');
 
       // A short centred line sitting outside the body margin is a heading even
       // when it is not set larger — small-caps chapter labels ("CHAPTER SEVEN")
       // are typically set at or below body size and would otherwise read as a
       // stray sentence in the middle of the prose.
-      if (isCentred && lineWords.length <= MAX_FURNITURE_WORDS && line.left > bodyLeft + bodyHeight) {
-        return { ...line, role: 'heading' };
+      if (
+        isCentred &&
+        lineWords.length <= MAX_FURNITURE_WORDS &&
+        line.left > bodyLeft + bodyHeight &&
+        ratio >= CENTRED_HEADING_MIN_SIZE
+      ) {
+        return classify('heading');
       }
     }
 
-    return { ...line, role: 'body' };
+    return classify('body');
   });
 
-  refineBodyLines(lines, bodyHeight, context.isWord);
+  refineBodyLines(lines, context);
 
   return { lines, pageNumber };
 }
@@ -457,36 +842,79 @@ function markerOrdinal(text: string): number | null {
   return null;
 }
 
+/** A bullet glyph no line of prose opens with, unlike "-" or "*". */
+const UNAMBIGUOUS_BULLET = /^[•●▪◦]\s/;
+
 /**
- * Mark the list items in one run of adjacent body lines.
+ * Mark the list items in one run of body lines.
  *
- * Requires two or more marker lines sharing a left edge and, for numbered or
- * lettered markers, counting up by one. Prose wrapping so that two lines both
+ * Markers are grouped by left edge, one group per nesting level, so a bulleted
+ * list inside a numbered one is found as two lists rather than rejected as
+ * misaligned. Within a level, numbered or lettered markers must count up by
+ * one, in sequences of two or more. Prose wrapping so that two lines both
  * happen to start with "2)" and "3)" is possible; prose doing that in sequence
  * at the same indent is not something real paragraphs do.
  */
 function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
   const markers = run.filter(l => LIST_MARKER.test(l.text.trim()));
-  if (markers.length < 2) return;
-
-  const aligned = markers.every(l => Math.abs(l.left - markers[0].left) <= bodyHeight * 0.5);
-  if (!aligned) return;
-
-  const ordinals = markers.map(l => markerOrdinal(l.text));
-
-  // A "1." read as "I." or "l." — the letter ordinal would be 9 or 12. When
-  // the next marker is 2 it can only have been a 1; repair the text as well,
-  // or the list renders as "I. … / 2. …".
-  if (ordinals.length >= 2 && ordinals[1] === 2 && /^[Il][.)]\s/.test(markers[0].text.trim())) {
-    ordinals[0] = 1;
-    markers[0].text = markers[0].text.trim().replace(/^[Il]/, '1');
+  const tolerance = bodyHeight * 0.5;
+  for (const left of clusterLefts(markers.map(l => l.left), tolerance)) {
+    markListLevel(markers.filter(l => Math.abs(l.left - left) <= tolerance));
   }
 
-  const allBullets = ordinals.every(o => o === null);
-  const sequential = ordinals.every((o, i) => o !== null && (i === 0 || o === ordinals[i - 1]! + 1));
-  if (!allBullets && !sequential) return;
+  // A lone numbered line followed by a list nested under it is that list's
+  // parent item ("1. Review the list:" / "• Debit card …"), even with no
+  // sibling to count from.
+  run.forEach((line, i) => {
+    const next = run[i + 1];
+    if (line.role === 'body' && LIST_MARKER.test(line.text.trim()) &&
+        next?.role === 'listItem' && next.left > line.left + tolerance) {
+      line.role = 'listItem';
+    }
+  });
+}
 
-  for (const line of markers) line.role = 'listItem';
+/** Mark the list items among the markers of one indent level, in order. */
+function markListLevel(markers: ClassifiedLine[]): void {
+  const bullets = markers.filter(l => markerOrdinal(l.text) === null);
+  for (const line of bullets) {
+    if (bullets.length >= 2 || line.hangingMarker || UNAMBIGUOUS_BULLET.test(line.text.trim())) {
+      line.role = 'listItem';
+    }
+  }
+
+  const numbered = markers.filter(l => markerOrdinal(l.text) !== null);
+  let sequence: ClassifiedLine[] = [];
+  let previous = 0;
+  const close = () => {
+    if (sequence.length >= 2 || sequence.every(l => l.hangingMarker)) {
+      for (const line of sequence) line.role = 'listItem';
+    }
+    sequence = [];
+  };
+
+  numbered.forEach((line, i) => {
+    let ordinal = markerOrdinal(line.text)!;
+
+    // A "1." read as "I." or "l." — the letter ordinal would be 9 or 12. When
+    // the next marker is 2 it can only have been a 1; repair the text as well,
+    // or the list renders as "I. … / 2. …".
+    const next = numbered[i + 1];
+    if (sequence.length === 0 && /^[Il][.)]\s/.test(line.text.trim()) &&
+        next !== undefined && markerOrdinal(next.text) === 2) {
+      ordinal = 1;
+      line.text = line.text.trim().replace(/^[Il]/, '1');
+    }
+
+    if (sequence.length > 0 && ordinal !== previous + 1) close();
+    sequence.push(line);
+    previous = ordinal;
+  });
+  close();
+}
+
+function isHeadingRole(role: LineRole): boolean {
+  return role === 'title' || role === 'heading' || role === 'subheading';
 }
 
 /**
@@ -498,11 +926,9 @@ function markListItems(run: ClassifiedLine[], bodyHeight: number): void {
  * subheadings because "1. Good title," inside a list also looks like an
  * outline marker.
  */
-function refineBodyLines(
-  lines: ClassifiedLine[],
-  bodyHeight: number,
-  isWord: ((word: string) => boolean) | undefined
-): void {
+function refineBodyLines(lines: ClassifiedLine[], context: StructureContext): void {
+  const { bodyHeight, lineGap, paragraphGap, isWord } = context;
+
   // ── Table of contents ──────────────────────────────────────────────────────
   // One line ending in "(p. 12)" is a cross-reference in prose; a contents
   // page has them line after line. The last page of a contents list can carry
@@ -532,19 +958,15 @@ function refineBodyLines(
   }
 
   // Lines in reading order that actually render.
-  const flow = lines.filter(
-    l => l.role !== 'pageNumber' && l.role !== 'runningHead' && l.role !== 'sideText'
-  );
-  const paragraphGap = bodyHeight * PARAGRAPH_GAP_RATIO;
+  const flow = lines.filter(l => !isDropped(l.role));
 
   // ── Lists ──────────────────────────────────────────────────────────────────
+  // Runs break at headings and other non-body lines, not at vertical gaps: a
+  // web page spaces list items further apart than lines of a paragraph, and
+  // splitting there left every item alone in its run, never forming a list.
   let runStart = 0;
   for (let i = 1; i <= flow.length; i++) {
-    const runEnds =
-      i === flow.length ||
-      flow[i].role !== 'body' ||
-      flow[i - 1].role !== 'body' ||
-      gapBetween(flow[i - 1], flow[i]) > paragraphGap;
+    const runEnds = i === flow.length || flow[i].role !== 'body' || flow[i - 1].role !== 'body';
     if (!runEnds) continue;
     markListItems(flow.slice(runStart, i), bodyHeight);
     runStart = i;
@@ -566,17 +988,50 @@ function refineBodyLines(
     const previous = flow[i - 1];
     const setApart =
       previous === undefined ||
-      previous.role === 'title' ||
-      previous.role === 'heading' ||
-      previous.role === 'subheading' ||
+      isHeadingRole(previous.role) ||
       gapBetween(previous, line) > paragraphGap;
     if (setApart) line.role = 'subheading';
   });
 
+  // ── Headings that stand alone ──────────────────────────────────────────────
+  // A short line with space above and below, set a little larger than body
+  // or in capitals, is a heading even below HEADING_RATIO. Measured on a web
+  // page: section titles at 1.2x body and "APPLY YOUR SKILLS 4-1" banners at
+  // body size, both distinguished on screen by colour and weight, which OCR
+  // does not report. A callout or prose line ends in punctuation and runs on.
+  //
+  // The space below need only clear the ordinary line gap, not a paragraph
+  // break: a heading sits close to the text it introduces. Measured: 26px
+  // under "Prepare Report and Pay Bills" against 17px between body lines and
+  // a 27px paragraph threshold.
+  const headingGapBelow = lineGap + bodyHeight * 0.25;
+  flow.forEach((line, i) => {
+    if (line.role !== 'body') return;
+    const text = line.text.trim();
+    if (words(text).length > STANDALONE_HEADING_MAX_WORDS) return;
+    if (!/^[A-Z0-9]/.test(text) || /[.,;:?!]$/.test(text)) return;
+
+    const letters = text.replace(/[^A-Za-z]/g, '');
+    const capitals = letters.length >= 3 && letters === letters.toUpperCase();
+    if (line.size < CALLOUT_RATIO && !capitals) return;
+
+    const previous = flow[i - 1];
+    const next = flow[i + 1];
+    const apartAbove =
+      previous === undefined || isHeadingRole(previous.role) || gapBetween(previous, line) > paragraphGap;
+    const apartBelow = next === undefined || gapBetween(line, next) > headingGapBelow;
+    if (apartAbove && apartBelow) line.role = 'heading';
+  });
+
   // ── Callouts ───────────────────────────────────────────────────────────────
   for (const line of flow) {
-    if (line.role === 'body' && line.height / bodyHeight >= CALLOUT_RATIO) line.role = 'callout';
+    if (line.role === 'body' && line.size >= CALLOUT_RATIO) line.role = 'callout';
   }
+}
+
+/** Roles that never render. */
+function isDropped(role: LineRole): boolean {
+  return role === 'pageNumber' || role === 'runningHead' || role === 'sideText' || role === 'clipped';
 }
 
 /**
@@ -602,20 +1057,36 @@ function joinBodyLines(lineTexts: string[]): string {
   return out.trim();
 }
 
+/** One list item: its indent level and its paragraphs, each a run of lines. */
+interface ListItem {
+  level: number;
+  paragraphs: string[][];
+}
+
 /**
  * Render one analysed page as Markdown.
  *
  * Furniture is dropped: a folio and a running head repeat on every page of a
  * recording and are exactly the kind of interleaved noise that survives text
  * dedup, for the same reason `cropFrames` exists.
+ *
+ * `listLefts` are the left edges of each list nesting level, outermost first.
+ * Taken from this page alone when not given; `structurePages` passes the
+ * whole document's, because a frame that scrolled past a list's parent item
+ * shows only the nested items and would otherwise render them unindented.
  */
-export function renderPageMarkdown(structure: PageStructure, bodyHeight: number): string {
+export function renderPageMarkdown(
+  structure: PageStructure,
+  metrics: DocumentMetrics,
+  listLefts: number[] = listLevelLefts([structure], metrics.bodyHeight)
+): string {
+  const { bodyHeight, paragraphGap } = metrics;
   const blocks: string[] = [];
   let paragraph: string[] = [];
   let paragraphKind: 'body' | 'callout' = 'body';
-  // Each entry is one list item's lines, so a wrapped item can be rejoined.
-  let listItems: string[][] = [];
+  let listItems: ListItem[] = [];
   let itemLeft = 0;
+  let tableRows: string[][] = [];
   let previous: ClassifiedLine | null = null;
   // Index in `blocks` of a heading that a following line may continue.
   let openHeading = -1;
@@ -645,14 +1116,34 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
   // Items joined by single newlines so Markdown renders one list, not several.
   const flushList = () => {
     if (listItems.length > 0) {
-      blocks.push(listItems.map(item => formatListItem(joinBodyLines(item))).join('\n'));
+      blocks.push(listItems.map(formatListItem).join('\n'));
       listItems = [];
     }
   };
 
+  const flushTable = () => {
+    if (tableRows.length > 0) {
+      blocks.push(formatTable(tableRows));
+      tableRows = [];
+    }
+  };
+
   for (const line of structure.lines) {
-    if (line.role === 'pageNumber' || line.role === 'runningHead' || line.role === 'sideText') continue;
+    if (isDropped(line.role)) continue;
     const text = line.text.trim();
+
+    if (line.role === 'tableRow') {
+      flushParagraph();
+      flushList();
+      flushToc();
+      openHeading = -1;
+      // A row with a different number of cells starts a new table.
+      if (tableRows.length > 0 && tableRows[0].length !== line.cells!.length) flushTable();
+      tableRows.push(line.cells!);
+      previous = line;
+      continue;
+    }
+    flushTable();
 
     if (line.role === 'tocEntry') {
       flushParagraph();
@@ -667,7 +1158,7 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
     }
     flushToc();
 
-    if (line.role === 'title' || line.role === 'heading' || line.role === 'subheading') {
+    if (isHeadingRole(line.role)) {
       flushParagraph();
       flushList();
 
@@ -692,21 +1183,27 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
     }
     openHeading = -1;
 
-    const adjacent =
-      previous !== null && line.top - (previous.top + previous.height) <= bodyHeight * PARAGRAPH_GAP_RATIO;
+    const gap = previous !== null ? line.top - (previous.top + previous.height) : Infinity;
+    const adjacent = gap <= paragraphGap;
 
     if (line.role === 'listItem') {
       flushParagraph();
-      listItems.push([text]);
+      const level = listLefts.findIndex(left => Math.abs(left - line.left) <= bodyHeight * 0.5);
+      listItems.push({ level: Math.max(0, level), paragraphs: [[text]] });
       itemLeft = line.left;
       previous = line;
       continue;
     }
 
-    // A wrapped list item continues under its text, to the right of the marker.
-    if (listItems.length > 0 && line.role === 'body' && adjacent &&
+    // A wrapped list item continues under its text, to the right of the
+    // marker. A line under it after a paragraph's worth of space is a further
+    // paragraph of the same item ("Edit the vendor:" / "GPM@email.net"); one
+    // further away than that has left the list.
+    if (listItems.length > 0 && line.role === 'body' && gap <= paragraphGap * 2 &&
         line.left > itemLeft + bodyHeight * 0.5) {
-      listItems[listItems.length - 1].push(text);
+      const item = listItems[listItems.length - 1];
+      if (adjacent) item.paragraphs[item.paragraphs.length - 1].push(text);
+      else item.paragraphs.push([text]);
       previous = line;
       continue;
     }
@@ -737,7 +1234,16 @@ export function renderPageMarkdown(structure: PageStructure, bodyHeight: number)
   flushParagraph();
   flushList();
   flushToc();
+  flushTable();
   return blocks.join('\n\n');
+}
+
+/** Left edges of the list nesting levels found in `structures`, outermost first. */
+function listLevelLefts(structures: PageStructure[], bodyHeight: number): number[] {
+  return clusterLefts(
+    structures.flatMap(s => s.lines.filter(l => l.role === 'listItem').map(l => l.left)),
+    bodyHeight * 0.5
+  );
 }
 
 /**
@@ -778,12 +1284,33 @@ function headingPrefix(line: ClassifiedLine): string {
  * become "-". Lettered markers have no Markdown equivalent, so they are kept
  * as text inside a bullet — otherwise consecutive "a. …" / "b. …" lines would
  * collapse into a single paragraph.
+ *
+ * Nested levels and an item's later paragraphs are indented four spaces,
+ * which places them inside the item above under both "1. " and "- ".
  */
-function formatListItem(text: string): string {
-  if (/^\d{1,2}[.)]\s/.test(text)) return text;
-  const bullet = text.match(/^[•●▪◦·*–-]\s+(.*)$/);
-  if (bullet) return `- ${bullet[1]}`;
-  return `- ${text}`;
+function formatListItem(item: ListItem): string {
+  const indent = '    '.repeat(item.level);
+  const [first, ...rest] = item.paragraphs.map(joinBodyLines);
+  const bullet = first.match(/^[•●▪◦·*–-]\s+(.*)$/);
+  const head = /^\d{1,2}[.)]\s/.test(first) ? first : `- ${bullet ? bullet[1] : first}`;
+  return [`${indent}${head}`, ...rest.map(p => `\n${indent}    ${p}`)].join('\n');
+}
+
+/**
+ * Render table rows as a Markdown table.
+ *
+ * The header row is left empty: nothing in the geometry says whether the
+ * first row is a header or data, and promoting data to a header would
+ * misstate it.
+ */
+function formatTable(rows: string[][]): string {
+  const row = (cells: string[]) => `| ${cells.map(c => c.replace(/\|/g, '\\|')).join(' | ')} |`;
+  const columns = rows[0].length;
+  return [
+    row(Array(columns).fill('')),
+    `|${Array(columns).fill('---').join('|')}|`,
+    ...rows.map(row),
+  ].join('\n');
 }
 
 /**
@@ -800,14 +1327,16 @@ export function structurePages(
   pages: OcrPageGeometry[],
   isWord?: (word: string) => boolean
 ): string[] {
-  const bodyHeight = documentBodyHeight(pages);
-  if (bodyHeight <= 0) return pages.map(() => '');
+  const metrics = documentMetrics(pages);
+  if (metrics.bodyHeight <= 0) return pages.map(() => '');
 
   const context: StructureContext = {
-    bodyHeight,
+    ...metrics,
     runningHeads: collectRunningHeads(pages, MARGIN_BAND),
     isWord,
   };
 
-  return pages.map(page => renderPageMarkdown(analysePage(page, context), bodyHeight));
+  const structures = pages.map(page => analysePage(page, context));
+  const listLefts = listLevelLefts(structures, metrics.bodyHeight);
+  return structures.map(structure => renderPageMarkdown(structure, metrics, listLefts));
 }

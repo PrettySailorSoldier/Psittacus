@@ -99,26 +99,31 @@ function croppedPathFor(framePath: string): string {
  *
  * `region` is interpreted in the source image's native pixel coordinates and
  * is clamped to its bounds before use.
+ *
+ * `scale` enlarges the crop, for re-reading print too small for the OCR
+ * engine at its native size.
  */
 export async function cropFrame(
   framePath: string,
   region: CropRegion,
-  outPath: string = croppedPathFor(framePath)
+  outPath: string = croppedPathFor(framePath),
+  scale = 1
 ): Promise<string> {
   const img = await loadImage(await toDataUrl(framePath), framePath);
 
   const r = clampRegion(region, img.naturalWidth, img.naturalHeight);
 
   const canvas = document.createElement('canvas');
-  canvas.width = r.width;
-  canvas.height = r.height;
+  canvas.width = Math.round(r.width * scale);
+  canvas.height = Math.round(r.height * scale);
 
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Could not get 2D canvas context');
 
-  // Source rect (r) → destination rect filling the canvas 1:1, so the crop is
-  // a straight pixel copy with no resampling.
-  ctx.drawImage(img, r.x, r.y, r.width, r.height, 0, 0, r.width, r.height);
+  // Source rect (r) → destination rect filling the canvas. At scale 1 the
+  // crop is a straight pixel copy with no resampling.
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, r.x, r.y, r.width, r.height, 0, 0, canvas.width, canvas.height);
 
   const blob = await canvasToBlob(canvas);
   const bytes = new Uint8Array(await blob.arrayBuffer());

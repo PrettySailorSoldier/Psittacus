@@ -71,6 +71,19 @@ const SUPPLEMENT = [
 const MISREAD_ROMAN = /^([1lIiVvXx]{2,5})\.(\s+)(\S+)/;
 const ROMAN = /^(X{0,3})(IX|IV|V?I{0,3})$/;
 
+/**
+ * Spacing and dash repairs that need no dictionary.
+ *
+ * Windows OCR sets a space before trailing punctuation it reads as a separate
+ * word ("Add these vendors :"), and reads the en dash of a number range as an
+ * em dash ("10007—10008").
+ */
+export function tidyPunctuation(text: string): string {
+  return text
+    .replace(/(\S) ([:;,!?])(?=\s|$)/g, '$1$2')
+    .replace(/(\d) ?— ?(\d)/g, '$1–$2');
+}
+
 export interface Corrector {
   /** Whether `word` (any case) is in the dictionary. */
   isWord(word: string): boolean;

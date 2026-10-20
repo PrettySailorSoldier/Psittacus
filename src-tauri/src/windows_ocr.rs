@@ -24,12 +24,30 @@
 //!     A machine with no usable pack fails at engine creation, not per frame.
 //!   * Images above `OcrEngine::MaxImageDimension` (10000px) are rejected.
 
+/// One recognised word and its bounding box.
+#[derive(serde::Serialize)]
+pub struct OcrWordBox {
+    pub text: String,
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// One recognised line, with the union of its words' bounding boxes.
 ///
 /// Coordinates are in pixels of the source image, origin top-left. They are
 /// returned alongside `image_width`/`image_height` so the frontend can reason
 /// in page-relative terms (is this line in the bottom margin? is it centred?)
 /// without having to re-open the frame to find out how big it was.
+///
+/// The words travel too because the union box is a poor measure of type size:
+/// it spans the tallest ascender to the lowest descender of whatever letters
+/// the line happens to contain. Measured on a web page: "Add and Edit Vendors"
+/// (no descenders) set in a larger face came back shorter than a body line,
+/// and one bold word in a taller font pushed a whole sentence into callout
+/// range. Per-word boxes let the structure pass compare like letter shapes
+/// with like.
 #[derive(serde::Serialize)]
 pub struct OcrLineBox {
     pub text: String,
@@ -37,6 +55,7 @@ pub struct OcrLineBox {
     pub top: f32,
     pub width: f32,
     pub height: f32,
+    pub words: Vec<OcrWordBox>,
 }
 
 /// Result returned to the frontend for each OCR'd frame.
@@ -138,6 +157,7 @@ fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
         // the Latin packs this app targets; CJK packs would need the line's
         // own `Text()` instead.
         let mut line_words: Vec<String> = Vec::new();
+        let mut word_boxes: Vec<OcrWordBox> = Vec::new();
         let (mut l, mut t) = (f32::MAX, f32::MAX);
         let (mut r, mut b) = (f32::MIN, f32::MIN);
 
@@ -151,6 +171,13 @@ fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
                 t = t.min(rect.Y);
                 r = r.max(rect.X + rect.Width);
                 b = b.max(rect.Y + rect.Height);
+                word_boxes.push(OcrWordBox {
+                    text: text.clone(),
+                    left: rect.X,
+                    top: rect.Y,
+                    width: rect.Width,
+                    height: rect.Height,
+                });
             }
             line_words.push(text.clone());
             words.push(text);
@@ -166,6 +193,7 @@ fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
             top: t,
             width: (r - l).max(0.0),
             height: (b - t).max(0.0),
+            words: word_boxes,
         });
     }
 

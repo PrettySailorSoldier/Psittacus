@@ -5,15 +5,17 @@
  * images, so it needs no vision model — a small instruct model is enough and
  * is an order of magnitude cheaper than a second llava pass over every frame.
  *
- * It targets two artifacts the per-frame pipeline cannot fix on its own:
+ * It targets character-level OCR damage the per-frame pipeline cannot fix on
+ * its own — word fragments, misread characters ("nt" where the page said
+ * "present"), stray punctuation and symbols.
  *
- *   1. Character-level OCR damage — word fragments, misread characters
- *      ("nt" where the page said "present"), stray punctuation and symbols.
- *   2. Cross-frame duplication — scroll-captured recordings overlap, so the
- *      same paragraph is transcribed two or three times with slightly
- *      different truncation at the edges. Perceptual frame dedup can't catch
- *      this (the frames genuinely differ) and the similarity-based text dedup
- *      only catches whole-segment repeats.
+ * It works on the stitched Markdown transcript, not on raw per-frame text.
+ * It used to take the raw frames and was asked to deduplicate them too, which
+ * failed two ways on a real run: the model only saw three frames per request,
+ * so repeats across a request boundary survived (one section appeared three
+ * times); and the frames carried no structure, so headings came out flat and
+ * list numbers the engine had returned out of order were simply deleted.
+ * Overlap is now resolved by `dedup.ts::stitchFrames` before this runs.
  *
  * The result is deliberately NOT written back over the raw extraction. Whether
  * cleanup helps or introduces its own errors is a per-document judgment call,
@@ -29,43 +31,32 @@ const OLLAMA_URL = 'http://localhost:11434/api/generate';
 const CLEANUP_MODEL = 'llama3.2:3b';
 
 /**
- * Frames per request. Small batches keep each prompt well inside the model's
- * effective context, where instruction-following stays reliable — a single
- * request carrying every frame tends to drift into summarising instead of
- * transcribing, which is the one thing this pass must not do.
+ * Character ceiling per request. Small requests keep each prompt well inside
+ * the model's effective context, where instruction-following stays reliable —
+ * a long request tends to drift into summarising instead of transcribing,
+ * which is the one thing this pass must not do.
  */
-const FRAMES_PER_CHUNK = 3;
-
-/** Hard character ceiling per request, applied before the frame count. */
-const MAX_CHARS_PER_CHUNK = 6000;
-
-/** How much of the previous cleaned chunk to show as overlap context. */
-const CONTEXT_TAIL_CHARS = 500;
+const MAX_CHARS_PER_CHUNK = 3000;
 
 const SYSTEM_PROMPT = [
-  'You are a transcription cleanup tool. You are given raw OCR output from',
-  'several consecutive frames of a screen recording of a book or document.',
-  'The frames overlap, so the SAME passage often appears two or three times.',
+  'You are a transcription cleanup tool. You are given part of a book or',
+  'document that was transcribed by OCR and formatted as Markdown.',
   '',
-  'Produce ONE continuous clean version of the passage. Specifically:',
+  'Repair OCR damage and nothing else. Specifically:',
   '',
-  '1. DEDUPLICATE. This is the most important task. The input repeats itself.',
-  '   Where a sentence or paragraph appears more than once, output it EXACTLY',
-  '   ONCE, keeping the most complete version. Merge a truncated copy into the',
-  '   fuller copy rather than emitting both.',
-  '2. DROP REPEATED UI LINES. Short lines that recur in every frame are the',
-  '   reader application\'s navigation chrome, not document text (for example a',
-  '   sidebar list, a page counter, or a running header). Remove every',
-  '   occurrence of them.',
-  '3. FIX OCR CHARACTER ERRORS where the intended word is unambiguous:',
+  '1. FIX OCR CHARACTER ERRORS where the intended word is unambiguous:',
   '   misread letters ("rnay" -> "may", "tirne" -> "time"), split or merged',
   '   words, stray symbols, spurious punctuation.',
-  '4. REJOIN lines that OCR split mid-sentence. Keep real paragraph breaks.',
-  '5. PRESERVE READING ORDER.',
+  '2. If the same sentence or paragraph appears twice in a row, keep it once.',
+  '3. KEEP THE MARKDOWN EXACTLY AS GIVEN. Every heading ("#", "##"), list',
+  '   marker ("1.", "-") and its indentation, table row ("| a | b |"), quote',
+  '   marker (">"), "---" separator and blank line stays where it is. Never',
+  '   remove a line because it is short, in capitals, or looks like a label.',
   '',
   'Absolute rules — violating these makes the output useless:',
   '- Do NOT summarise, paraphrase, shorten, explain or rewrite the content.',
   '- Do NOT add any words, sentences, headings, notes or commentary of your own.',
+  '  Never insert a word that is not in the input, even one that seems missing.',
   '- Do NOT complete, continue or "finish" a sentence that is cut off in the',
   '  input. Reproduce it cut off, exactly as given.',
   '- Preserve the author\'s exact wording everywhere it is legible.',
@@ -86,6 +77,100 @@ export function stripPreamble(text: string): string {
     // lines … If you want me to rejoin the lines, please let me know.").
     .replace(/\n+\(?Note:[^\n]*\b(?:I|me|you)\b[\s\S]*$/i, '')
     .trim();
+}
+
+/**
+ * Remove quote marks the model wrapped around its answer.
+ *
+ * The prompt delimits the input with """, and the model sometimes echoes part
+ * of that fused to the first or last word — on a real run `"Plus; 7/28/2029`
+ * and `$481.10"`, which `stripPreamble` misses because the quote does not sit
+ * on a line of its own. Only stripped where the input had no quote there.
+ */
+export function stripStrayQuotes(output: string, input: string): string {
+  let out = output;
+  if (/^["“”]/.test(out) && !/^\s*["“”]/.test(input)) out = out.replace(/^["“”]{1,3}/, '');
+  if (/["“”]$/.test(out) && !/["“”]\s*$/.test(input)) out = out.replace(/["“”]{1,3}$/, '');
+  return out.trim();
+}
+
+/**
+ * Longest run of inserted words `dropInsertedWords` removes. A longer run is
+ * more likely a sentence the model moved than one it made up, and removing it
+ * would lose text, so it is left in place.
+ */
+const MAX_DROPPED_INSERTION = 3;
+
+/**
+ * Undo short insertions: words in the output with no counterpart at all in
+ * the input.
+ *
+ * The output is aligned against the input word by word. A run of output words
+ * opposite one or more input words is a repair (a misread word, a split or a
+ * merge) and is kept. A run opposite nothing is new text. On a real run the
+ * model turned "you will create the transactions" into "you will create the
+ * necessary transactions", borrowing a word from a nearby line; that word is
+ * opposite nothing, and is removed here.
+ */
+export function dropInsertedWords(output: string, input: string): string {
+  const normalise = (token: string) => token.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  const source = input.split(/\s+/).map(normalise).filter(Boolean);
+  // Each token keeps its trailing whitespace, so removing one leaves the
+  // surrounding layout (line breaks, indentation) intact.
+  const tokens = [...output.matchAll(/\S+\s*/g)].map(m => ({ raw: m[0], norm: normalise(m[0]) }));
+  const words = tokens.map((t, i) => ({ ...t, i })).filter(t => t.norm);
+
+  const n = words.length;
+  const m = source.length;
+  if (n === 0 || m === 0 || n * m > 4_000_000) return output;
+
+  // Longest common subsequence over normalised words.
+  const table = new Uint16Array((n + 1) * (m + 1));
+  const at = (i: number, j: number) => i * (m + 1) + j;
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      table[at(i, j)] = words[i].norm === source[j]
+        ? table[at(i + 1, j + 1)] + 1
+        : Math.max(table[at(i + 1, j)], table[at(i, j + 1)]);
+    }
+  }
+
+  // Walk the alignment. `pending` collects output words matched to nothing;
+  // when the next match arrives, they were a pure insertion if no input word
+  // was skipped in the same stretch.
+  const drop = new Set<number>();
+  let pending: number[] = [];
+  let skippedInput = false;
+  const settle = () => {
+    if (!skippedInput && pending.length > 0 && pending.length <= MAX_DROPPED_INSERTION) {
+      for (const index of pending) drop.add(index);
+    }
+    pending = [];
+    skippedInput = false;
+  };
+
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (words[i].norm === source[j]) {
+      settle();
+      i++;
+      j++;
+    } else if (table[at(i + 1, j)] >= table[at(i, j + 1)]) {
+      pending.push(words[i].i);
+      i++;
+    } else {
+      skippedInput = true;
+      j++;
+    }
+  }
+  while (i < n) pending.push(words[i++].i);
+  if (j < m) skippedInput = true;
+  settle();
+
+  if (drop.size === 0) return output;
+  console.log(`[Cleanup] removed inserted word(s): ${[...drop].map(k => tokens[k].raw.trim()).join(', ')}`);
+  return tokens.filter((_, k) => !drop.has(k)).map(t => t.raw).join('');
 }
 
 /**
@@ -127,15 +212,14 @@ export function rejectReason(output: string, input: string): string | null {
 }
 
 /**
- * Group frame texts into request-sized chunks.
+ * Split the transcript into request-sized chunks at block boundaries.
  *
- * A chunk closes when it reaches `FRAMES_PER_CHUNK` frames or would exceed
- * `MAX_CHARS_PER_CHUNK` characters, whichever comes first. A single frame that
- * is already over the ceiling becomes its own chunk rather than being split
+ * A chunk closes before it would exceed `MAX_CHARS_PER_CHUNK`. A single block
+ * already over the ceiling becomes its own chunk rather than being split
  * mid-sentence — splitting inside a paragraph would hand the model half a
  * sentence and invite it to invent the other half.
  */
-export function chunkFrameTexts(frameTexts: string[]): string[] {
+export function chunkText(text: string): string[] {
   const chunks: string[] = [];
   let current: string[] = [];
   let currentChars = 0;
@@ -148,33 +232,29 @@ export function chunkFrameTexts(frameTexts: string[]): string[] {
     }
   };
 
-  for (const raw of frameTexts) {
-    const text = raw.trim();
-    if (!text) continue; // blank frames carry nothing to clean
+  for (const raw of text.split(/\n{2,}/)) {
+    const block = raw.replace(/\s+$/, '');
+    if (!block.trim()) continue;
 
-    if (current.length > 0 &&
-        (current.length >= FRAMES_PER_CHUNK || currentChars + text.length > MAX_CHARS_PER_CHUNK)) {
-      flush();
-    }
-
-    current.push(text);
-    currentChars += text.length;
+    if (current.length > 0 && currentChars + block.length > MAX_CHARS_PER_CHUNK) flush();
+    current.push(block);
+    currentChars += block.length;
   }
 
   flush();
   return chunks;
 }
 
-/** Send one chunk to the model and return its cleaned text. */
-async function cleanupChunk(chunk: string, previousTail: string): Promise<string> {
-  // Showing the tail of the previous cleaned chunk lets the model drop a
-  // paragraph that straddles the chunk boundary, which it otherwise cannot see.
-  const contextBlock = previousTail
-    ? `Text already emitted (for context only — do NOT repeat or re-output any of it):\n"""\n${previousTail}\n"""\n\n`
-    : '';
-
-  const prompt =
-    `${SYSTEM_PROMPT}\n\n${contextBlock}Raw OCR text to clean:\n"""\n${chunk}\n"""\n\nCleaned text:`;
+/**
+ * Send one chunk to the model and return its cleaned text.
+ *
+ * The chunk is sent alone. Each request used to carry the tail of the previous
+ * one so the model could drop a paragraph repeated across the boundary; that
+ * repetition is now resolved by stitching, and on a real run the model copied
+ * the context back out at the head of its answer.
+ */
+async function cleanupChunk(chunk: string): Promise<string> {
+  const prompt = `${SYSTEM_PROMPT}\n\nRaw OCR text to clean:\n"""\n${chunk}\n"""\n\nCleaned text:`;
 
   let response: Response;
   try {
@@ -222,11 +302,12 @@ async function cleanupChunk(chunk: string, previousTail: string): Promise<string
   }
 
   const data = await response.json();
-  return stripPreamble((data.response ?? '').trim());
+  const cleaned = stripStrayQuotes(stripPreamble((data.response ?? '').trim()), chunk);
+  return dropInsertedWords(cleaned, chunk);
 }
 
 /**
- * Clean up raw per-frame OCR output and return the assembled result.
+ * Clean up the stitched transcript and return the result.
  *
  * Chunks are processed in order and concatenated, so reading order is
  * preserved across the whole document.
@@ -236,26 +317,22 @@ async function cleanupChunk(chunk: string, previousTail: string): Promise<string
  * silent hole in the middle.
  */
 export async function cleanupExtractedText(
-  rawFrameTexts: string[],
+  text: string,
   onProgress?: (done: number, total: number) => void
 ): Promise<string> {
-  const chunks = chunkFrameTexts(rawFrameTexts);
+  const chunks = chunkText(text);
 
   if (chunks.length === 0) return '';
 
-  console.log(`[Cleanup] ${rawFrameTexts.length} frame(s) -> ${chunks.length} chunk(s), model=${CLEANUP_MODEL}`);
+  console.log(`[Cleanup] ${text.length} chars -> ${chunks.length} chunk(s), model=${CLEANUP_MODEL}`);
 
   const cleaned: string[] = [];
   let failures = 0;
   let firstFailure: Error | null = null;
 
   for (let i = 0; i < chunks.length; i++) {
-    const previousTail = cleaned.length > 0
-      ? cleaned[cleaned.length - 1].slice(-CONTEXT_TAIL_CHARS)
-      : '';
-
     try {
-      const out = await cleanupChunk(chunks[i], previousTail);
+      const out = await cleanupChunk(chunks[i]);
       const rejected = out.length > 0 ? rejectReason(out, chunks[i]) : 'empty output';
       if (rejected) {
         console.warn(`[Cleanup] chunk ${i + 1}/${chunks.length} rejected (${rejected}), keeping raw text`);

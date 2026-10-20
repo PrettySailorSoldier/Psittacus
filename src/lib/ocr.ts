@@ -1,9 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
-import { deduplicateText } from './dedup';
-import { structurePages, documentBodyHeight, HEADING_RATIO } from './structure';
+import { stitchFrames } from './dedup';
+import { structurePages, documentMetrics, lineSize, HEADING_RATIO } from './structure';
 import { restoreSectionSigns } from './sectionSigns';
-import { createCorrector, type Corrector } from './ocrCorrect';
-import { cropFrame } from './cropFrames';
+import { createCorrector, tidyPunctuation, type Corrector } from './ocrCorrect';
+import { cropFrame, clampRegion } from './cropFrames';
 
 
 const OLLAMA_URL = 'http://localhost:11434/api/generate';
@@ -145,7 +145,7 @@ export async function runOcrPipeline(
   }
 
   return {
-    text: deduplicateText(framesText, dedupeThreshold),
+    text: stitchFrames(framesText, dedupeThreshold),
     framesProcessed: framesText.length,
     framesWithText,
     framesFailed,
@@ -186,6 +186,15 @@ const PRIMARY_PLAUSIBILITY_THRESHOLD = 85;
  */
 const PRIMARY_MIN_WORDS = 3;
 
+/** One recognised word and its bounding box, in source-image pixels. */
+export interface OcrWordBox {
+  text: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 /** One recognised line and the union of its words' bounding boxes, in source-image pixels. */
 export interface OcrLineBox {
   text: string;
@@ -193,6 +202,12 @@ export interface OcrLineBox {
   top: number;
   width: number;
   height: number;
+  /**
+   * The line's words as the engine read them, before any text repair. Used
+   * for their heights only: type size is measured word by word (see
+   * `structure.ts::lineSize`). Absent where a line was built without them.
+   */
+  words?: OcrWordBox[];
 }
 
 /**
@@ -224,16 +239,15 @@ interface WindowsOcrCommandResult {
 export interface HybridOcrResult {
   text: string;
   /**
-   * Per-frame OCR output, in frame order, before text-level dedup is applied.
-   * Kept so the optional cleanup pass (`lib/textCleanup.ts`) can work from the
-   * raw extraction, and so the raw result stays available to the user rather
-   * than being replaced by any downstream transform.
+   * Per-frame OCR output, in frame order, before frames are stitched together.
+   * Kept so the raw result stays available rather than being replaced by any
+   * downstream transform.
    */
   frameTexts: string[];
   /**
    * Markdown reconstruction of the recording, with headings, paragraph breaks
-   * and page furniture resolved from the geometry. Deduplicated the same way
-   * `text` is.
+   * and page furniture resolved from the geometry. Stitched across frames the
+   * same way `text` is.
    *
    * Falls back to the plain text of any frame the structure pass could not
    * analyse, so this is never *less* complete than `text` — only better
@@ -315,15 +329,15 @@ async function rereadSuspectHeadings(
   framesText: string[],
   corrector: Corrector
 ): Promise<number> {
-  const bodyHeight = documentBodyHeight(framePages);
-  if (bodyHeight <= 0) return 0;
+  const metrics = documentMetrics(framePages);
+  if (metrics.bodyHeight <= 0) return 0;
 
   let replaced = 0;
   for (let i = 0; i < framePages.length; i++) {
     const page = framePages[i];
     for (let j = 0; j < page.lines.length; j++) {
       const line = page.lines[j];
-      if (line.height < bodyHeight * HEADING_RATIO || !corrector.hasUnknownWord(line.text)) continue;
+      if (lineSize(line, metrics) < HEADING_RATIO || !corrector.hasUnknownWord(line.text)) continue;
 
       // Padding keeps ascenders, descenders and the first/last glyph whole.
       const padX = line.height * 0.5;
@@ -358,6 +372,142 @@ async function rereadSuspectHeadings(
       console.log(`[OCR] heading re-read: "${line.text}" -> "${reread}"`);
       framesText[i] = framesText[i].replace(line.text, reread);
       page.lines[j] = { ...line, text: reread };
+      replaced++;
+    }
+  }
+  return replaced;
+}
+
+/** Lines measuring below this fraction of body size are re-read enlarged. */
+const SMALL_TEXT_RATIO = 0.8;
+
+/** Enlargement for the small-text re-read. */
+const SMALL_TEXT_SCALE = 3;
+
+/** Small lines closer than this many body heights are re-read as one region. */
+const SMALL_TEXT_CLUSTER_GAP = 4;
+
+/** Text repair applied to every line Windows OCR returns, wherever it is read. */
+function repairLine(text: string, corrector: Corrector | null): string {
+  const tidied = tidyPunctuation(restoreSectionSigns(text));
+  return corrector ? corrector.correctLine(tidied) : tidied;
+}
+
+function lineWordCount(lines: OcrLineBox[]): number {
+  return lines.reduce((n, l) => n + l.text.split(/\s+/).filter(Boolean).length, 0);
+}
+
+function lineUnknownCount(lines: OcrLineBox[], isWord: (word: string) => boolean): number {
+  let n = 0;
+  for (const line of lines) {
+    for (const token of line.text.split(/\s+/)) {
+      const core = token.replace(/[^\p{L}\p{N}]+/gu, '');
+      if (core && !/\d/.test(core) && !isWord(core)) n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * Re-read clusters of small print — text inside a screenshot or figure — from
+ * a crop enlarged `SMALL_TEXT_SCALE` times.
+ *
+ * Measured on a report screenshot inside a page, 13–17px text against 25px
+ * body: "Compact" read as "Corn pact" and "Total" as "A Total" at native size,
+ * and correctly from a 3x crop. (Dropped decimal points did not come back at
+ * any scale tried; `structure.ts::repairFigureColumns` handles those.)
+ *
+ * The re-read replaces the region's lines only when it read at least most of
+ * as many words with no more misread ones, so a worse second reading is
+ * discarded. Returns how many regions were replaced.
+ */
+async function rereadSmallText(
+  framePaths: string[],
+  framePages: OcrPageGeometry[],
+  framesText: string[],
+  corrector: Corrector | null
+): Promise<number> {
+  const metrics = documentMetrics(framePages);
+  if (metrics.bodyHeight <= 0) return 0;
+
+  let replaced = 0;
+  for (let i = 0; i < framePages.length; i++) {
+    const page = framePages[i];
+    const small = page.lines
+      .filter(l => lineSize(l, metrics) < SMALL_TEXT_RATIO)
+      .sort((a, b) => a.top - b.top);
+
+    const clusters: OcrLineBox[][] = [];
+    for (const line of small) {
+      const cluster = clusters[clusters.length - 1];
+      const bottom = cluster ? Math.max(...cluster.map(l => l.top + l.height)) : -Infinity;
+      if (cluster && line.top - bottom <= metrics.bodyHeight * SMALL_TEXT_CLUSTER_GAP) cluster.push(line);
+      else clusters.push([line]);
+    }
+
+    for (const [c, cluster] of clusters.entries()) {
+      // One small line is a caption or a footnote marker, not a figure.
+      if (cluster.length < 2) continue;
+
+      const pad = metrics.bodyHeight * 0.5;
+      const left = Math.min(...cluster.map(l => l.left)) - pad;
+      const top = Math.min(...cluster.map(l => l.top)) - pad;
+      const right = Math.max(...cluster.map(l => l.left + l.width)) + pad;
+      const bottom = Math.max(...cluster.map(l => l.top + l.height)) + pad;
+      const region = clampRegion(
+        { x: left, y: top, width: right - left, height: bottom - top },
+        page.imageWidth,
+        page.imageHeight
+      );
+      const toPage = <T extends { left: number; top: number; width: number; height: number }>(box: T): T => ({
+        ...box,
+        left: box.left / SMALL_TEXT_SCALE + region.x,
+        top: box.top / SMALL_TEXT_SCALE + region.y,
+        width: box.width / SMALL_TEXT_SCALE,
+        height: box.height / SMALL_TEXT_SCALE,
+      });
+
+      let reread: OcrLineBox[];
+      try {
+        const path = await cropFrame(
+          framePaths[i],
+          region,
+          framePaths[i].replace(/(\.png)?$/i, `_small${c}.png`),
+          SMALL_TEXT_SCALE
+        );
+        const raw = await invoke<WindowsOcrCommandResult>('windows_ocr_image', { path });
+        reread = raw.lines.map(l => ({
+          ...toPage(l),
+          text: repairLine(l.text, corrector),
+          words: l.words?.map(toPage),
+        }));
+      } catch (e) {
+        console.warn(`[OCR] frame ${i + 1}: small-text re-read failed:`, e);
+        continue;
+      }
+
+      const inRegion = (l: OcrLineBox) => {
+        const x = l.left + l.width / 2;
+        const y = l.top + l.height / 2;
+        return x >= region.x && x <= region.x + region.width && y >= region.y && y <= region.y + region.height;
+      };
+      const original = page.lines.filter(inRegion);
+      const fewerWords = lineWordCount(reread) < lineWordCount(original) * 0.8;
+      const moreMisreads =
+        corrector !== null &&
+        lineUnknownCount(reread, corrector.isWord) > lineUnknownCount(original, corrector.isWord);
+      if (fewerWords || moreMisreads) {
+        console.log(`[OCR] frame ${i + 1}: small-text re-read rejected (${lineWordCount(reread)} words)`);
+        continue;
+      }
+
+      // Inserted where the region's first line was; the structure pass puts
+      // a single-column page back into reading order regardless.
+      const at = page.lines.slice(0, page.lines.indexOf(original[0])).filter(l => !inRegion(l)).length;
+      const kept = page.lines.filter(l => !inRegion(l));
+      kept.splice(at, 0, ...reread);
+      page.lines = kept;
+      framesText[i] = kept.map(l => l.text).join('\n');
       replaced++;
     }
   }
@@ -422,10 +572,7 @@ export async function runHybridOcrPipeline(
       // Repaired here, before anything reads the text, so the plain transcript,
       // the structured one and the cleanup input all carry the same fix.
       // `text` is rebuilt from the lines, exactly as the Rust side builds it.
-      const lines = raw.lines.map(line => {
-        const text = restoreSectionSigns(line.text);
-        return { ...line, text: corrector ? corrector.correctLine(text) : text };
-      });
+      const lines = raw.lines.map(line => ({ ...line, text: repairLine(line.text, corrector) }));
       wResult = { ...raw, lines, text: lines.map(l => l.text).join('\n') };
     } catch (e) {
       console.warn(`[OCR] frame ${label}: windows OCR invocation error —`, e);
@@ -554,15 +701,17 @@ export async function runHybridOcrPipeline(
     );
   }
 
+  const smallRegions = await rereadSmallText(framePaths, framePages, framesText, corrector);
+  if (smallRegions > 0) console.log(`[OCR] ${smallRegions} small-text region(s) re-read enlarged`);
+
   if (corrector) {
     const replaced = await rereadSuspectHeadings(framePaths, framePages, framesText, corrector);
     if (replaced > 0) console.log(`[OCR] ${replaced} heading line(s) re-read by ${OLLAMA_MODEL}`);
   }
 
-  // Structure is recovered per frame and then deduplicated exactly as the
-  // plain text is, rather than being applied to the already-merged transcript.
-  // Dedup drops whole frames, so doing it in this order means the geometry and
-  // the text it describes are still talking about the same page.
+  // Structure is recovered per frame and then stitched exactly as the plain
+  // text is, rather than being applied to the already-merged transcript: the
+  // geometry describes one frame, so it has to be read before frames merge.
   //
   // Frames the structure pass could not analyse (no geometry, i.e. answered by
   // the vision fallback) keep their plain text, so nothing is ever dropped from
@@ -572,8 +721,8 @@ export async function runHybridOcrPipeline(
   );
 
   return {
-    text: deduplicateText(framesText, dedupeThreshold),
-    structuredText: deduplicateText(structuredFrames, dedupeThreshold),
+    text: stitchFrames(framesText, dedupeThreshold, corrector?.isWord),
+    structuredText: stitchFrames(structuredFrames, dedupeThreshold, corrector?.isWord),
     frameTexts: framesText,
     framePages,
     framesProcessed: framesText.length,

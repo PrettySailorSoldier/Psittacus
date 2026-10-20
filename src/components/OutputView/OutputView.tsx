@@ -12,12 +12,6 @@ interface OutputViewProps {
   frameCount: number;
   exportFormat: 'txt' | 'md';
   onReset: () => void;
-  /**
-   * Raw per-frame OCR output. Cleanup runs from this rather than from the
-   * already-deduplicated `text`, so the model sees the extraction as it came
-   * off the frames.
-   */
-  rawFrameTexts: string[];
 }
 
 type View = 'raw' | 'cleaned';
@@ -28,7 +22,6 @@ export default function OutputView({
   frameCount,
   exportFormat,
   onReset,
-  rawFrameTexts,
 }: OutputViewProps) {
   const [copied, setCopied] = useState(false);
 
@@ -52,7 +45,9 @@ export default function OutputView({
     setCleanupProgress({ done: 0, total: 0 });
 
     try {
-      const result = await cleanupExtractedText(rawFrameTexts, (done, total) =>
+      // The stitched transcript, not the raw frames: overlap between frames is
+      // already resolved, and the Markdown structure is there to be kept.
+      const result = await cleanupExtractedText(text, (done, total) =>
         setCleanupProgress({ done, total })
       );
       setCleanedText(result);
@@ -156,7 +151,7 @@ export default function OutputView({
           <button
             className={styles.ghostBtn}
             onClick={handleCleanup}
-            disabled={isCleaning || rawFrameTexts.length === 0}
+            disabled={isCleaning || text.trim().length === 0}
           >
             {isCleaning ? (
               <>

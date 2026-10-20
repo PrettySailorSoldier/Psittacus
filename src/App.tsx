@@ -38,8 +38,6 @@ export default function App() {
     text: string;
     wordCount: number;
     frameCount: number;
-    /** Raw per-frame OCR text, kept so the optional cleanup pass can rerun from source. */
-    frameTexts: string[];
   } | null>(null);
   // Path of the cached recording mp4 so we can discard it after processing
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
@@ -232,7 +230,6 @@ export default function App() {
         text: displayText,
         wordCount,
         frameCount: finalResult.framesProcessed,
-        frameTexts: finalResult.frameTexts,
       });
       setAppState('done');
       succeeded = true;
@@ -343,7 +340,6 @@ export default function App() {
             frameCount={output.frameCount}
             exportFormat={settings.exportFormat}
             onReset={handleReset}
-            rawFrameTexts={output.frameTexts}
           />
         )}
       </div>
