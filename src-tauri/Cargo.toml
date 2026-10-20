@@ -20,12 +20,17 @@ tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["time", "sync"] }
+# Encodes auto-capture frames. Already in the build via the clipboard plugin
+# (arboard -> image), so this adds no new code.
+png = "0.18"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    # Auto-capture: simulated wheel/click input and the Esc stop key.
+    "Win32_UI_Input_KeyboardAndMouse",
     # Windows.Media.Ocr and the WinRT plumbing it needs: image decoding,
     # file-backed streams, IAsyncOperation::get, and COM apartment init.
     "Win32_System_Com",

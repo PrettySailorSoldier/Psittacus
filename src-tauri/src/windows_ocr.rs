@@ -89,8 +89,9 @@ pub async fn windows_ocr_image(path: String) -> Result<WindowsOcrResult, String>
         .map_err(|e| format!("Task join error: {e}"))?
 }
 
+/// Also called directly by auto-capture to find the "Next" control.
 #[cfg(windows)]
-fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
+pub(crate) fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
     use windows::core::HSTRING;
     use windows::Graphics::Imaging::BitmapDecoder;
     use windows::Media::Ocr::OcrEngine;
@@ -214,7 +215,7 @@ fn recognize(path: &str) -> Result<WindowsOcrResult, String> {
 }
 
 #[cfg(not(windows))]
-fn recognize(_path: &str) -> Result<WindowsOcrResult, String> {
+pub(crate) fn recognize(_path: &str) -> Result<WindowsOcrResult, String> {
     Err("Windows OCR is only available on Windows".to_string())
 }
 

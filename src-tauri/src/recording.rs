@@ -49,8 +49,11 @@ pub struct RecordingState {
 /// the grab to one monitor is what keeps a second display's icons, taskbar and
 /// unrelated windows out of the recording in the first place, rather than
 /// leaving it to the crop step to cut them back out.
+///
+/// Auto-capture grabs the same monitor, so a crop region drawn on a recording
+/// lands on the same pixels when it drives the browser itself.
 #[cfg(target_os = "windows")]
-fn monitor_capture_region(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
+pub(crate) fn monitor_capture_region(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };

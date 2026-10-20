@@ -181,8 +181,11 @@ function mergeOverlap(
   return text.slice(0, a[aEnd].end) + frame.slice(b[bEnd].end);
 }
 
-/** Whether most of `frame` already appears in the recent part of `text`. */
-function isContained(text: string, frame: string): boolean {
+/**
+ * Whether most of `frame` already appears in the recent part of `text`.
+ * Also used to catch an auto-captured section that repeats the one before it.
+ */
+export function isContained(text: string, frame: string): boolean {
   const frameShingles = shingles(frame, SHINGLE_SIZE);
   if (frameShingles.size === 0) return true;
   const recent = shingles(text.slice(-(frame.length * 4 + 2000)), SHINGLE_SIZE);

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { stitchFrames } from './dedup';
+import { stitchFrames, isContained } from './dedup';
 import { structurePages, documentMetrics, lineSize, HEADING_RATIO } from './structure';
 import { restoreSectionSigns } from './sectionSigns';
 import { createCorrector, tidyPunctuation, type Corrector } from './ocrCorrect';
@@ -514,6 +514,47 @@ async function rereadSmallText(
   return replaced;
 }
 
+/** The line placed between auto-captured sections in the output. */
+export function sectionDivider(section: number): string {
+  return `════════ Section ${section} ════════`;
+}
+
+/**
+ * Stitch frames within each section, then join the sections with a divider.
+ *
+ * Auto-capture records one section per page of the source. The end of one
+ * page never overlaps the start of the next, so each is stitched on its own
+ * rather than asking the overlap merge to find a join that is not there. A
+ * section whose text the one before already holds is dropped: that is Next
+ * reloading the same page.
+ *
+ * Without `sections` this is plain `stitchFrames`.
+ */
+function stitchSections(
+  frames: string[],
+  sections: number[] | undefined,
+  threshold: number,
+  isWord?: (word: string) => boolean
+): string {
+  if (!sections) return stitchFrames(frames, threshold, isWord);
+
+  const groups: string[][] = [];
+  frames.forEach((frame, i) => (groups[sections[i]] ??= []).push(frame));
+
+  const texts: string[] = [];
+  for (const group of groups) {
+    if (!group) continue;
+    const text = stitchFrames(group, threshold, isWord).trim();
+    if (!text) continue;
+    if (texts.length > 0 && isContained(texts[texts.length - 1], text)) {
+      console.log('[OCR] dropped a section that repeats the one before it');
+      continue;
+    }
+    texts.push(text);
+  }
+  return texts.map((t, i) => (i === 0 ? t : `${sectionDivider(i + 1)}\n\n${t}`)).join('\n\n');
+}
+
 /**
  * Run OCR on `framePaths` using the built-in Windows recogniser as the primary
  * engine.
@@ -535,12 +576,18 @@ async function rereadSmallText(
  * Tesseract remains available as `tesseract_ocr_image` and is no longer in
  * this path; `runOcrPipeline` (vision-model-only) is likewise still here as a
  * manual escape hatch.
+ *
+ * `frameSections`, from auto-capture, gives each frame's section index. When
+ * present, frames are stitched within their section only and sections are
+ * separated by `sectionDivider`. The structure pass still measures the whole
+ * run at once, so body size and running heads come from every section.
  */
 export async function runHybridOcrPipeline(
   framePaths: string[],
   language: string,
   dedupeThreshold: number,
-  onFrameDone: (frameIndex: number, text: string) => void
+  onFrameDone: (frameIndex: number, text: string) => void,
+  frameSections?: number[]
 ): Promise<HybridOcrResult> {
   const framesText: string[] = [];
   const framePages: OcrPageGeometry[] = [];
@@ -721,8 +768,8 @@ export async function runHybridOcrPipeline(
   );
 
   return {
-    text: stitchFrames(framesText, dedupeThreshold, corrector?.isWord),
-    structuredText: stitchFrames(structuredFrames, dedupeThreshold, corrector?.isWord),
+    text: stitchSections(framesText, frameSections, dedupeThreshold, corrector?.isWord),
+    structuredText: stitchSections(structuredFrames, frameSections, dedupeThreshold, corrector?.isWord),
     frameTexts: framesText,
     framePages,
     framesProcessed: framesText.length,

@@ -11,6 +11,8 @@ interface OutputViewProps {
   wordCount: number;
   frameCount: number;
   exportFormat: 'txt' | 'md';
+  /** Extra context for the stats line, e.g. how an auto-capture run ended. */
+  note?: string | null;
   onReset: () => void;
 }
 
@@ -21,6 +23,7 @@ export default function OutputView({
   wordCount,
   frameCount,
   exportFormat,
+  note,
   onReset,
 }: OutputViewProps) {
   const [copied, setCopied] = useState(false);
@@ -104,6 +107,7 @@ export default function OutputView({
               {Math.abs(wordCount - shownWordCount)} vs raw
             </span>
           )}
+          {note && <span className={styles.deltaNote}> &middot; {note}</span>}
         </div>
 
         <div className={styles.toggleGroup} role="tablist" aria-label="Output version">

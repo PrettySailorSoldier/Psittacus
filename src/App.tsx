@@ -12,15 +12,26 @@ import ProgressView from './components/ProgressView/ProgressView';
 import OutputView from './components/OutputView/OutputView';
 import RecordButton from './components/RecordButton/RecordButton';
 import CropSelector from './components/CropSelector/CropSelector';
+import AutoCapturePanel from './components/AutoCapture/AutoCapturePanel';
+import AutoCaptureView from './components/AutoCapture/AutoCaptureView';
 
 import { Settings, loadSettings, saveSettings, loadCropRegion, saveCropRegion } from './store/settings';
 import { getVideoDuration, extractFrames } from './lib/ffmpeg';
 import { dedupeFrames } from './lib/frameDedup';
 import { CropRegion, cropFrames } from './lib/cropFrames';
 // runOcrPipeline kept as an unused manual fallback (vision-model-only mode)
-import { runOcrPipeline as _runOcrPipeline, runHybridOcrPipeline } from './lib/ocr';
+import { runOcrPipeline as _runOcrPipeline, runHybridOcrPipeline, type HybridOcrResult } from './lib/ocr';
+import {
+  AutoCaptureProgress,
+  AutoCaptureResult,
+  COUNTDOWN_SECONDS,
+  captureScreenFrame,
+  onAutoCaptureProgress,
+  startAutoCapture,
+  stopAutoCapture,
+} from './lib/autoCapture';
 
-export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'cropping' | 'done';
+export type AppState = 'idle' | 'recording' | 'ready' | 'processing' | 'cropping' | 'autocapture' | 'done';
 
 export interface FileInfo {
   path: string;
@@ -41,6 +52,9 @@ export default function App() {
   } | null>(null);
   // Path of the cached recording mp4 so we can discard it after processing
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
+  const [autoProgress, setAutoProgress] = useState<AutoCaptureProgress | null>(null);
+  // Shown beside the output stats, e.g. why an auto-capture run stopped.
+  const [outputNote, setOutputNote] = useState<string | null>(null);
 
   // ── Crop step state ────────────────────────────────────────────────────────
   // The crop selector sits in the middle of an async pipeline, so `handleRun`
@@ -49,7 +63,13 @@ export default function App() {
   // render. Keeping the resolver in a ref (not state) avoids re-rendering the
   // selector every time the pipeline touches unrelated state.
   const cropResolver = useRef<((region: CropRegion | null) => void) | null>(null);
-  const [cropPrompt, setCropPrompt] = useState<{ framePath: string; frameCount: number } | null>(null);
+  // The state the app moves to once the crop is decided.
+  const cropNextState = useRef<AppState>('processing');
+  const [cropPrompt, setCropPrompt] = useState<{
+    framePath: string;
+    frameCount: number;
+    subtitle?: string;
+  } | null>(null);
 
   useEffect(() => {
     loadSettings().then(setSettings);
@@ -131,21 +151,49 @@ export default function App() {
   /**
    * Show the crop selector and wait for the user's decision.
    * Resolves with a region to crop to, or null if they skipped.
+   * `then` is the state shown once they decide.
    */
-  const askForCropRegion = (framePath: string, frameCount: number) =>
+  const askForCropRegion = (
+    framePath: string,
+    frameCount: number,
+    then: AppState = 'processing',
+    subtitle?: string
+  ) =>
     new Promise<CropRegion | null>(resolve => {
       cropResolver.current = resolve;
-      setCropPrompt({ framePath, frameCount });
+      cropNextState.current = then;
+      setCropPrompt({ framePath, frameCount, subtitle });
       setAppState('cropping');
     });
 
-  /** Hand the decision back to the parked pipeline and return to the progress view. */
+  /** Hand the decision back to the parked pipeline and move on. */
   const finishCropStep = (region: CropRegion | null) => {
     const resolve = cropResolver.current;
     cropResolver.current = null;
     setCropPrompt(null);
-    setAppState('processing');
+    setAppState(cropNextState.current);
     resolve?.(region);
+  };
+
+  /** Show a finished OCR run. */
+  const showResult = (result: HybridOcrResult, note: string | null = null) => {
+    // Show the structured reconstruction rather than the flat transcript.
+    // It carries the same words plus the headings, paragraph breaks and
+    // dropped page furniture recovered from the OCR geometry, and already
+    // falls back to a frame's plain text wherever geometry was unavailable —
+    // so it is never less complete than `text`. The guard covers the case
+    // where no frame had geometry at all (every frame went to the vision
+    // fallback), which leaves the structured output empty.
+    const displayText =
+      result.structuredText.trim().length > 0 ? result.structuredText : result.text;
+
+    setOutput({
+      text: displayText,
+      wordCount: displayText.split(/\s+/).filter(Boolean).length,
+      frameCount: result.framesProcessed,
+    });
+    setOutputNote(note);
+    setAppState('done');
   };
 
   // ── Extraction pipeline ───────────────────────────────────────────────────
@@ -212,26 +260,7 @@ export default function App() {
         }
       );
 
-      // Show the structured reconstruction rather than the flat transcript.
-      // It carries the same words plus the headings, paragraph breaks and
-      // dropped page furniture recovered from the OCR geometry, and already
-      // falls back to a frame's plain text wherever geometry was unavailable —
-      // so it is never less complete than `text`. The guard covers the case
-      // where no frame had geometry at all (every frame went to the vision
-      // fallback), which leaves the structured output empty.
-      const displayText =
-        finalResult.structuredText.trim().length > 0
-          ? finalResult.structuredText
-          : finalResult.text;
-
-      const wordCount = displayText.split(/\s+/).filter(Boolean).length;
-
-      setOutput({
-        text: displayText,
-        wordCount,
-        frameCount: finalResult.framesProcessed,
-      });
-      setAppState('done');
+      showResult(finalResult);
       succeeded = true;
 
     } catch (error) {
@@ -265,9 +294,97 @@ export default function App() {
     }
   };
 
+  // ── Auto-capture ──────────────────────────────────────────────────────────
+
+  const handleAutoCapture = async () => {
+    if (!settings) return;
+
+    // The crop step needs a frame of the monitor as it is now. Psittacus'
+    // window is excluded from capture, so this shows the browser behind it.
+    let referencePath: string;
+    try {
+      referencePath = await captureScreenFrame();
+    } catch (e) {
+      showError(`Could not capture the screen:\n${e instanceof Error ? e.message : String(e)}`, 'Auto-capture Error');
+      return;
+    }
+
+    const region = await askForCropRegion(
+      referencePath,
+      0,
+      'autocapture',
+      'Drag a rectangle around the page content to capture. It can leave out the ' +
+        'site header and footer: the Next button is looked for in the whole browser ' +
+        'window if it is not inside this area.'
+    );
+    remove(referencePath).catch(e => console.warn('Failed to remove reference frame:', e));
+
+    setAutoProgress(null);
+    const unlisten = await onAutoCaptureProgress(setAutoProgress);
+    let result: AutoCaptureResult;
+    try {
+      result = await startAutoCapture({
+        region,
+        stepFraction: settings.autoScrollStep,
+        maxSections: settings.autoMaxSections,
+        nextLabels: settings.autoNextLabels,
+        followArrowLinks: settings.autoArrowLinks,
+        countdownSecs: COUNTDOWN_SECONDS,
+      });
+    } catch (e) {
+      setAppState('idle');
+      showError(`Auto-capture failed:\n${e instanceof Error ? e.message : String(e)}`, 'Auto-capture Error');
+      return;
+    } finally {
+      unlisten();
+    }
+
+    if (result.sections.length === 0) {
+      remove(result.frameDir, { recursive: true }).catch(() => {});
+      setAppState('idle');
+      return;
+    }
+    await processAutoCapture(result);
+  };
+
+  const processAutoCapture = async (result: AutoCaptureResult) => {
+    if (!settings) return;
+    const frames = result.sections.flatMap(s => s.frames);
+    const frameSections = result.sections.flatMap((s, i) => s.frames.map(() => i));
+
+    setAppState('processing');
+    setProgress({ current: 0, total: frames.length, lastSnippet: 'Starting OCR...' });
+
+    try {
+      const finalResult = await runHybridOcrPipeline(
+        frames,
+        settings.language,
+        settings.dedupeThreshold,
+        (frameIndex, text) => {
+          setProgress(prev => ({ ...prev, current: frameIndex + 1, lastSnippet: text || '(No text found)' }));
+        },
+        frameSections
+      );
+      showResult(
+        finalResult,
+        `${result.sections.length} section${result.sections.length === 1 ? '' : 's'} auto-captured · ${result.stopReason}`
+      );
+      // Only once the text is out: the frames are the only copy of the run.
+      remove(result.frameDir, { recursive: true }).catch(e => console.warn('Failed to clean up frames:', e));
+    } catch (error) {
+      console.error(error);
+      showError(
+        `Processing failed:\n${error instanceof Error ? error.message : String(error)}\n\n` +
+        `The captured frames were kept in ${result.frameDir}`
+      );
+      setAppState('idle');
+    }
+  };
+
   const handleReset = () => {
     setFile(null);
     setOutput(null);
+    setOutputNote(null);
     setRecordingPath(null);
     setProgress({ current: 0, total: 0, lastSnippet: '' });
     setAppState('idle');
@@ -301,6 +418,22 @@ export default function App() {
           />
         )}
 
+        {appState === 'idle' && (
+          <AutoCapturePanel
+            settings={settings}
+            onChange={handleSettingsChange}
+            onStart={handleAutoCapture}
+          />
+        )}
+
+        {appState === 'autocapture' && (
+          <AutoCaptureView
+            progress={autoProgress}
+            maxSections={settings.autoMaxSections}
+            onStop={() => stopAutoCapture()}
+          />
+        )}
+
         {appState === 'ready' && (
           <ControlPanel
             settings={settings}
@@ -315,6 +448,7 @@ export default function App() {
           <CropSelector
             framePath={cropPrompt.framePath}
             frameCount={cropPrompt.frameCount}
+            subtitle={cropPrompt.subtitle}
             loadInitialRegion={loadCropRegion}
             onConfirm={(region, frameWidth, frameHeight) => {
               // Fire-and-forget: a failed save costs a redraw next run, not this one.
@@ -339,6 +473,7 @@ export default function App() {
             wordCount={output.wordCount}
             frameCount={output.frameCount}
             exportFormat={settings.exportFormat}
+            note={outputNote}
             onReset={handleReset}
           />
         )}
