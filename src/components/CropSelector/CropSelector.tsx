@@ -28,6 +28,8 @@ interface CropSelectorProps {
   loadInitialRegion: (frameWidth: number, frameHeight: number) => Promise<CropRegion | null>;
   /** Number of frames the confirmed crop will be applied to - shown as context. */
   frameCount: number;
+  /** Replaces the default instructions, for uses other than cropping a recording. */
+  subtitle?: string;
   onConfirm: (region: CropRegion, frameWidth: number, frameHeight: number) => void;
   onSkip: () => void;
 }
@@ -58,6 +60,7 @@ export default function CropSelector({
   framePath,
   loadInitialRegion,
   frameCount,
+  subtitle,
   onConfirm,
   onSkip,
 }: CropSelectorProps) {
@@ -226,8 +229,12 @@ export default function CropSelector({
           <Crop size={16} /> Select the page area
         </div>
         <div className={styles.subtitle}>
-          Drag a rectangle around the page content only - leave out the sidebar,
-          page-turn arrows and any other reader chrome. Applies to all {frameCount} frames.
+          {subtitle ?? (
+            <>
+              Drag a rectangle around the page content only - leave out the sidebar,
+              page-turn arrows and any other reader chrome. Applies to all {frameCount} frames.
+            </>
+          )}
         </div>
       </div>
 

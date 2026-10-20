@@ -1,7 +1,9 @@
+mod auto_capture;
 mod recording;
 mod tesseract_ocr;
 mod windows_ocr;
 
+use auto_capture::AutoCaptureState;
 use recording::RecordingState;
 use tauri::{Manager, RunEvent};
 
@@ -29,12 +31,16 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(RecordingState::default())
+        .manage(AutoCaptureState::default())
         .invoke_handler(tauri::generate_handler![
             recording::start_recording,
             recording::stop_recording,
             recording::discard_recording,
             tesseract_ocr::tesseract_ocr_image,
             windows_ocr::windows_ocr_image,
+            auto_capture::capture_screen_frame,
+            auto_capture::start_auto_capture,
+            auto_capture::stop_auto_capture,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

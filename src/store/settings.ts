@@ -4,6 +4,18 @@ export interface Settings {
   language: string;
   dedupeThreshold: number;
   exportFormat: 'txt' | 'md';
+  /** Auto-capture stops after this many sections. */
+  autoMaxSections: number;
+  /** Auto-capture scroll step, as a fraction of the capture region's height. */
+  autoScrollStep: number;
+  /** Labels of the control auto-capture clicks to reach the next section. */
+  autoNextLabels: string[];
+  /**
+   * Also follow a link followed by an arrow at the bottom right of the
+   * browser window. LabLearning labels its next control with the next
+   * section's title ("Keeping on Track →"), which no fixed label matches.
+   */
+  autoArrowLinks: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -11,6 +23,10 @@ const DEFAULT_SETTINGS: Settings = {
   language: 'eng',
   dedupeThreshold: 0.85,
   exportFormat: 'txt',
+  autoMaxSections: 10,
+  autoScrollStep: 0.75,
+  autoNextLabels: ['Next', 'Next Section', 'Next Page', 'Continue'],
+  autoArrowLinks: true,
 };
 
 // Lazy initialization of the store

@@ -2631,6 +2631,7 @@ dependencies = [
 name = "psittacus"
 version = "1.0.0"
 dependencies = [
+ "png 0.18.1",
  "serde",
  "serde_json",
  "tauri",
